@@ -13,6 +13,9 @@ symlinks — every state change is a file appearing or moving. The full design
 python3 chatserver.py adduser alice --data /var/lib/internal-chat
 python3 chatserver.py adduser bob   --data /var/lib/internal-chat
 
+# lost password: admin reset (forces a change, kills all sessions)
+python3 chatserver.py passwd alice  --data /var/lib/internal-chat
+
 # TLS cert (internal CA or self-signed; clients pin it)
 openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
     -keyout server.pem -out server.pem -subj "/CN=chat.internal"

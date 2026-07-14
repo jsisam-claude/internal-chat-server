@@ -35,9 +35,10 @@ from urllib.parse import parse_qs, quote, urlsplit
 USER_RE = re.compile(r"^[a-z0-9_.-]{1,32}$")
 GID_RE = re.compile(r"^[gd]-[a-z0-9_.-]{1,72}$")
 MID_RE = re.compile(r"^\d{13}-[0-9a-f]{12}$")
-# queue entry: "<msg-id>" (a message) or "<msg-id>~d~<user>" / "<msg-id>~r~<user>"
-# (a delivered/read flag event for a message the queue's owner sent)
-ENTRY_RE = re.compile(r"^(\d{13}-[0-9a-f]{12})(?:~([dr])~([a-z0-9_.-]{1,32}))?$")
+# queue entry: "<msg-id>" (a message), "<msg-id>~d~<user>" / "<msg-id>~r~<user>"
+# (delivered/read flag events for a message the queue's owner sent), or
+# "<msg-id>~x~server" (routing failed; the owner's message bounced)
+ENTRY_RE = re.compile(r"^(\d{13}-[0-9a-f]{12})(?:~([drx])~([a-z0-9_.-]{1,32}))?$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 FID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -105,8 +106,18 @@ class Store:
     def __init__(self, root, iters: int = PBKDF2_ITERS):
         self.root = Path(root).resolve()
         self.iters = iters
+        self._id_lock = threading.Lock()
+        self._last_ms = 0
         for name in ("tmp", "incoming", "users", "groups", "archive", "rejected"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
+
+    def next_mid(self) -> str:
+        """Sorted listings are the timeline, so ids must never go backwards —
+        even if NTP steps the clock. Monotonic within this process."""
+        with self._id_lock:
+            ms = max(now_ms(), self._last_ms)
+            self._last_ms = ms
+        return f"{ms:013d}-{secrets.token_hex(6)}"
 
     # ---- paths -----------------------------------------------------------
     def user_dir(self, user: str) -> Path:
@@ -166,11 +177,13 @@ class Store:
                                 bytes.fromhex(auth["salt"]), auth["iters"])
         return auth if hmac.compare_digest(h.hex(), auth["hash"]) else None
 
-    def set_password(self, user: str, password: str) -> None:
+    def set_password(self, user: str, password: str,
+                     must_change: bool = False) -> None:
         auth = json.loads((self.user_dir(user) / "auth.json").read_text())
         salt = secrets.token_bytes(16)
         h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, self.iters)
-        auth.update(salt=salt.hex(), hash=h.hex(), iters=self.iters, must_change=False)
+        auth.update(salt=salt.hex(), hash=h.hex(), iters=self.iters,
+                    must_change=must_change)
         self.write_atomic(self.user_dir(user) / "auth.json", json.dumps(auth).encode())
 
     # ---- sessions (token = "<user>:<secret>", stored as sha256 marker) ----
@@ -269,7 +282,7 @@ class Store:
             return nf.read_text()  # retried send: same nonce -> same message
         except FileNotFoundError:
             pass
-        mid = f"{now_ms():013d}-{secrets.token_hex(6)}"
+        mid = self.next_mid()
         b = self.root / "tmp" / f"m-{mid}"
         (b / "attachments").mkdir(parents=True)
         (b / "to").write_text(gid)
@@ -285,6 +298,21 @@ class Store:
             os.replace(meta, b / "attachments" / f"{i}.meta")
         os.replace(b, self.root / "incoming" / mid)
         self.write_atomic(nf, mid.encode())
+        return mid
+
+    def spool_system(self, actor: str, gid: str, text: str, event: dict) -> str:
+        """Group lifecycle (created/join/leave) is announced in-band: a system
+        event is just a message dir with a `system` marker, so members learn
+        about new groups and roster changes through the one queue they already
+        poll. Only server code writes the marker — clients cannot inject it."""
+        mid = self.next_mid()
+        b = self.root / "tmp" / f"m-{mid}"
+        (b / "attachments").mkdir(parents=True)
+        (b / "to").write_text(gid)
+        (b / "from").write_text(actor)
+        (b / "message.txt").write_text(text)
+        (b / "system").write_text(json.dumps(event))
+        os.replace(b, self.root / "incoming" / mid)
         return mid
 
 
@@ -336,10 +364,24 @@ class Router(threading.Thread):
                 self._route(src)
             except Exception as e:
                 log(f"router: rejecting {src.name}: {e}")
-                try:
-                    os.replace(src, self.store.root / "rejected" / src.name)
-                except OSError:
-                    shutil.rmtree(src, ignore_errors=True)
+                self._bounce(src)
+
+    def _bounce(self, src: Path) -> None:
+        """A rejected message must not leave the sender's ✓ lying: park the
+        message dir in rejected/ and queue a ~x~ failure event to the sender."""
+        dst = self.store.root / "rejected" / src.name
+        try:
+            os.replace(src, dst)
+        except OSError:
+            shutil.rmtree(src, ignore_errors=True)
+            return
+        try:
+            sender = (dst / "from").read_text().strip()
+            if self.store.user_exists(sender):
+                self.store.queue_add(sender, f"{src.name}~x~server", dst)
+                self.notifier.notify(sender)
+        except OSError:
+            pass
 
     def _route(self, src: Path) -> None:
         mid = src.name
@@ -348,7 +390,9 @@ class Router(threading.Thread):
         if not (MID_RE.match(mid) and GID_RE.match(gid) and USER_RE.match(sender)):
             raise ValueError("bad ids")
         members = self.store.members(gid)
-        if sender not in members:
+        # system messages (server-written only) may announce the sender's own
+        # departure, so their sender need not still be a member
+        if sender not in members and not (src / "system").exists():
             raise ValueError("sender not a member")
         dest = self.store.msg_dir(gid, mid)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -517,7 +561,8 @@ class Api:
                 link.unlink(missing_ok=True)  # target archived/gone: drop
                 continue
             item = {"entry": link.name,
-                    "kind": {"d": "delivered", "r": "read", None: "msg"}[kind],
+                    "kind": {"d": "delivered", "r": "read", "x": "failed",
+                             None: "msg"}[kind],
                     "id": mid, "gid": gid,
                     "at": int(link.lstat().st_mtime * 1000)}
             if uid:
@@ -556,7 +601,8 @@ class Api:
                     if not marker.exists():
                         marker.touch()
                         sender = (mdir / "from").read_text().strip()
-                        if sender != user:
+                        # no ticks on system announcements
+                        if sender != user and not (mdir / "system").exists():
                             self.store.queue_add(sender, f"{mid}~d~{user}", mdir)
                             self.notifier.notify(sender)
             link.unlink(missing_ok=True)
@@ -580,7 +626,7 @@ class Api:
             if not mdir.is_dir():
                 continue
             sender = (mdir / "from").read_text().strip()
-            if sender == user:
+            if sender == user or (mdir / "system").exists():
                 continue
             marker = mdir / "readby" / user
             marker.parent.mkdir(exist_ok=True)
@@ -677,14 +723,20 @@ class Api:
                                  "sha256": meta["sha256"]})
                 except (ValueError, KeyError):
                     continue
-        return {"id": mid,
-                "gid": self.store.gid_of(mdir),
-                "from": (mdir / "from").read_text().strip(),
-                "at": int(mid[:13]),
-                "text": (mdir / "message.txt").read_text(),
-                "attachments": atts,
-                "deliveredto": self._flags(mdir / "deliveredto"),
-                "readby": self._flags(mdir / "readby")}
+        out = {"id": mid,
+               "gid": self.store.gid_of(mdir),
+               "from": (mdir / "from").read_text().strip(),
+               "at": int(mid[:13]),
+               "text": (mdir / "message.txt").read_text(),
+               "attachments": atts,
+               "deliveredto": self._flags(mdir / "deliveredto"),
+               "readby": self._flags(mdir / "readby")}
+        if (mdir / "system").is_file():
+            try:
+                out["system"] = json.loads((mdir / "system").read_text())
+            except ValueError:
+                out["system"] = {}
+        return out
 
     @staticmethod
     def _flags(folder: Path) -> dict:
@@ -778,6 +830,11 @@ class Api:
             if not self.store.user_exists(u):
                 raise ApiError(404, f"no such user: {u}")
         gid = self.store.create_group(name, roster)
+        # announce in-band: this is how the other members' clients learn the
+        # group exists at all (it lands in their queues like any message)
+        self.store.spool_system(user, gid, f"{user} created “{name}”",
+                                {"event": "created", "name": name, "by": user})
+        self.router.wake.set()
         return {"gid": gid, "members": sorted(roster)}
 
     def modify_members(self, user: str, gid: str, body: dict) -> dict:
@@ -795,17 +852,39 @@ class Api:
                 raise ApiError(404, f"no such user: {u}")
             if len(self.store.members(gid)) >= MAX_GROUP_MEMBERS:
                 raise ApiError(400, "group full")
-            (md / u).touch()
+            if (md / u).exists():
+                continue
+            (md / u).touch()  # marker first: the join announcement below must
+            self.store.spool_system(  # not predate the join timestamp
+                user, gid, f"{user} added {u}",
+                {"event": "join", "user": u, "by": user})
         for u in remove:
             if u != user:
                 raise ApiError(403, "members can only remove themselves")
+            if not (md / u).exists():
+                continue
+            self.store.spool_system(u, gid, f"{u} left",
+                                    {"event": "leave", "user": u})
             (md / u).unlink(missing_ok=True)
             # leaving sweeps this group's entries out of the leaver's queue
             for link in self.store.queue_dir(u).iterdir():
                 if (link.is_symlink()
                         and self.store.gid_of(os.path.realpath(link)) == gid):
                     link.unlink(missing_ok=True)
+        self.router.wake.set()
         return {"members": self.store.members(gid)}
+
+    def group_info(self, user: str, gid: str) -> dict:
+        """Single-group lookup — how a client resolves a gid it just learned
+        about from a system announcement in its queue."""
+        if not GID_RE.match(gid):
+            raise ApiError(400, "bad group id")
+        if not self.store.is_member(gid, user):
+            raise ApiError(403, "not a member")
+        gdir = self.store.group_dir(gid)
+        name = (gdir / "name").read_text() if (gdir / "name").is_file() else None
+        return {"gid": gid, "name": name, "members": self.store.members(gid),
+                "joined_at": self.store.joined_at(gid, user)}
 
     def list_users(self) -> dict:
         res = []
@@ -957,6 +1036,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(api.state(self._user(), p[2], p[3]))
         if p == ["groups"]:
             return self._send_json(api.list_groups(self._user()))
+        if len(p) == 2 and p[0] == "groups":
+            return self._send_json(api.group_info(self._user(), p[1]))
         if len(p) == 3 and p[0] == "groups" and p[2] == "messages":
             try:
                 limit = int(q.get("limit", ["50"])[0])
@@ -1064,6 +1145,17 @@ def cmd_adduser(args) -> None:
           f"{not args.no_change})")
 
 
+def cmd_passwd(args) -> None:
+    store = Store(args.data)
+    if not store.user_exists(args.user):
+        raise ApiError(404, "no such user")
+    password = args.password or getpass.getpass(f"new password for {args.user}: ")
+    store.set_password(args.user, password, must_change=not args.no_change)
+    for s in (store.user_dir(args.user) / "sessions").iterdir():
+        s.unlink(missing_ok=True)  # admin reset logs the user out everywhere
+    print(f"password reset for {args.user!r}; all sessions invalidated")
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1086,6 +1178,14 @@ def main(argv=None) -> None:
     au.add_argument("--no-change", action="store_true",
                     help="don't force a password change on first login")
     au.set_defaults(func=cmd_adduser)
+
+    pw = sub.add_parser("passwd", help="admin password reset (kills all sessions)")
+    pw.add_argument("user")
+    pw.add_argument("--data", default="./data")
+    pw.add_argument("--password", help="set non-interactively (visible in ps!)")
+    pw.add_argument("--no-change", action="store_true",
+                    help="don't force a password change on next login")
+    pw.set_defaults(func=cmd_passwd)
 
     args = ap.parse_args(argv)
     try:

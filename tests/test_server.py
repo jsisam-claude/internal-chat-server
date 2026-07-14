@@ -363,6 +363,77 @@ class ChatServerTest(unittest.TestCase):
         chatserver.Janitor(self.store).clean()
         self.assertFalse((self.store.queue_dir("carol") / mid).exists())
 
+    def drain_events(self, user, gid, want, tries=20):
+        """Dequeue system announcements for a group until `want` appears."""
+        events = []
+        for _ in range(tries):
+            for e in self.poll(user, wait=1):
+                if e["gid"] != gid or e["kind"] != "msg":
+                    continue
+                _, m = self.req("GET", f"/api/message/dequeue/{e['id']}", user=user)
+                events.append(m.get("system", {}).get("event"))
+                self.confirm(user, [e["entry"]])
+            if want in events:
+                return events
+        self.fail(f"never saw {want!r} for {user}, got {events}")
+
+    def test_12_group_lifecycle_announced_in_band(self):
+        status, g = self.req("POST", "/api/groups", user="alice",
+                             body={"name": "lifecycle", "members": ["bob"]})
+        gid = g["gid"]
+
+        # bob learns the group exists from his queue, then resolves the gid
+        self.drain_events("bob", gid, "created")
+        status, info = self.req("GET", f"/api/groups/{gid}", user="bob")
+        self.assertEqual(status, 200)
+        self.assertEqual((info["name"], info["members"]),
+                         ("lifecycle", ["alice", "bob"]))
+
+        # adding carol announces the join to carol herself (and to bob)
+        status, _ = self.req("POST", f"/api/groups/{gid}/members", user="alice",
+                             body={"add": ["carol"]})
+        self.assertEqual(status, 200)
+        self.drain_events("carol", gid, "join")
+        self.drain_events("bob", gid, "join")
+
+        # carol leaving is announced to those who remain, not to carol
+        status, _ = self.req("POST", f"/api/groups/{gid}/members", user="carol",
+                             body={"remove": ["carol"]})
+        self.assertEqual(status, 200)
+        self.drain_events("bob", gid, "leave")
+        self.assertEqual([e for e in self.poll("carol", wait=0)
+                          if e["gid"] == gid], [])
+
+        # announcements never generate ticks back to anyone
+        self.assertEqual([e for e in self.poll("alice", wait=0)
+                          if e["gid"] == gid and e["kind"] != "msg"], [])
+
+    def test_13_undeliverable_message_bounces_to_sender(self):
+        # bypass the API's membership check to simulate a message that
+        # becomes unroutable between accept and route
+        mid = self.store.spool_message("alice", "g-deadbeef00", "boom",
+                                       [], "bounce-nonce-01")
+        self.router.wake.set()
+        ev = self.poll_until("alice",
+                             lambda e: e["kind"] == "failed" and e["id"] == mid)
+        self.assertEqual(ev["user"], "server")
+        self.confirm("alice", [ev["entry"]])
+        self.assertTrue((self.store.root / "rejected" / mid).is_dir())
+
+    def test_14_admin_password_reset(self):
+        self.store.add_user("frank", "pw-frank-old", must_change=False)
+        tok = self.login("frank", "pw-frank-old")["token"]
+        chatserver.main(["passwd", "frank", "--data", self.tmp,
+                         "--password", "pw-frank-new"])
+        status, _ = self.req("GET", "/api/messages?wait=0",
+                             headers={"Authorization": "Bearer " + tok})
+        self.assertEqual(status, 401)  # reset kills existing sessions
+        status, body = self.req("POST", "/api/login",
+                                body={"user": "frank",
+                                      "password": "pw-frank-new"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["must_change"])  # reset forces a change
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
