@@ -298,6 +298,71 @@ class ChatServerTest(unittest.TestCase):
                              headers={"Authorization": "Bearer " + tok})
         self.assertEqual(status, 401)
 
+    def test_08_password_change_kills_other_sessions(self):
+        self.store.add_user("erin", "pw-erin-first", must_change=False)
+        tok1 = self.login("erin", "pw-erin-first")["token"]
+        tok2 = self.login("erin", "pw-erin-first")["token"]
+        status, _ = self.req("POST", "/api/password",
+                             headers={"Authorization": "Bearer " + tok1},
+                             body={"old": "pw-erin-first", "new": "pw-erin-second"})
+        self.assertEqual(status, 200)
+        status, _ = self.req("GET", "/api/messages?wait=0",
+                             headers={"Authorization": "Bearer " + tok1})
+        self.assertEqual(status, 200)  # the changing session survives
+        status, _ = self.req("GET", "/api/messages?wait=0",
+                             headers={"Authorization": "Bearer " + tok2})
+        self.assertEqual(status, 401)  # every other session is dead
+
+    def test_09_join_time_bounds_history(self):
+        import time as _t
+        status, g = self.req("POST", "/api/groups", user="alice",
+                             body={"name": "hist", "members": ["bob"]})
+        gid = g["gid"]
+        old = self.send_msg("alice", "before carol", gid=gid)["id"]
+        _t.sleep(0.05)  # join marker mtime must land after the old message
+        status, _ = self.req("POST", f"/api/groups/{gid}/members", user="alice",
+                             body={"add": ["carol"]})
+        self.assertEqual(status, 200)
+        _t.sleep(0.05)
+        new = self.send_msg("alice", "after carol", gid=gid)["id"]
+        self.poll_until("carol", lambda e: e["id"] == new)
+
+        _, hist = self.req("GET", f"/api/groups/{gid}/messages", user="carol")
+        ids = {m["id"] for m in hist["messages"]}
+        self.assertNotIn(old, ids)   # pre-join history is invisible
+        self.assertIn(new, ids)
+        _, hist = self.req("GET", f"/api/groups/{gid}/messages", user="bob")
+        self.assertLessEqual({old, new},
+                             {m["id"] for m in hist["messages"]})  # bob sees all
+        _, groups = self.req("GET", "/api/groups", user="carol")
+        entry = next(x for x in groups["groups"] if x["gid"] == gid)
+        self.assertEqual(entry["last"]["id"], new)
+
+    def test_10_leaving_sweeps_queue_and_access(self):
+        status, g = self.req("POST", "/api/groups", user="alice",
+                             body={"name": "leavers", "members": ["bob", "carol"]})
+        gid = g["gid"]
+        mid = self.send_msg("alice", "carol never reads this", gid=gid)["id"]
+        self.poll_until("carol", lambda e: e["id"] == mid)  # queued, unconfirmed
+        status, _ = self.req("POST", f"/api/groups/{gid}/members", user="carol",
+                             body={"remove": ["carol"]})
+        self.assertEqual(status, 200)
+        self.assertEqual([e for e in self.poll("carol", wait=0)
+                          if e["gid"] == gid], [])          # queue swept
+        status, _ = self.req("GET", f"/api/groups/{gid}/messages", user="carol")
+        self.assertEqual(status, 403)                       # access gone
+        self.poll_until("bob", lambda e: e["id"] == mid)
+        self.confirm("bob", [mid])
+
+    def test_11_janitor_prunes_dangling_queue_links(self):
+        import shutil as _sh
+        mid = self.send_msg("alice", "will be archived", to="carol")["id"]
+        self.poll_until("carol", lambda e: e["id"] == mid)  # symlink exists
+        mdir = self.store.msg_dir("d-alice-carol", mid)
+        _sh.rmtree(mdir)  # simulate retention archiving the day folder
+        chatserver.Janitor(self.store).clean()
+        self.assertFalse((self.store.queue_dir("carol") / mid).exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

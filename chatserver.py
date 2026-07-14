@@ -215,6 +215,14 @@ class Store:
     def is_member(self, gid: str, user: str) -> bool:
         return (self.group_dir(gid) / "members" / user).exists()
 
+    def joined_at(self, gid: str, user: str) -> int:
+        """The membership marker's mtime IS the join timestamp; members only
+        see history from their join onward (WhatsApp group semantics)."""
+        try:
+            return int((self.group_dir(gid) / "members" / user).stat().st_mtime * 1000)
+        except OSError:
+            return 0
+
     def _publish_group(self, gid: str, name: str, members: set[str]) -> bool:
         """Build the group dir in tmp/, then atomically rename into place."""
         b = self.root / "tmp" / f"g-{secrets.token_hex(8)}"
@@ -414,6 +422,15 @@ class Janitor(threading.Thread):
             prune(udir / "staged", 86400)
             prune(udir / "nonces", 7 * 86400)
             prune(udir / "sessions", SESSION_IDLE_DAYS * 86400)
+            # queue symlinks whose message was archived/deleted are dead;
+            # without this an always-offline user's queue would grow forever
+            try:
+                for link in (udir / "queue").iterdir():
+                    if link.is_symlink() and not os.path.exists(
+                            os.path.realpath(link)):
+                        link.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
         if self.retain_days > 0:
             cutoff = (datetime.now(timezone.utc)
                       - timedelta(days=self.retain_days)).strftime("%Y-%m-%d")
@@ -464,13 +481,18 @@ class Api:
         return {"token": self.store.new_session(user), "user": user,
                 "display": auth["display"], "must_change": auth["must_change"]}
 
-    def change_password(self, user: str, body: dict) -> dict:
+    def change_password(self, user: str, body: dict, keep_token: str) -> dict:
         old, new = body.get("old", ""), body.get("new", "")
         if not isinstance(new, str) or len(new) < 8 or len(new) > 128:
             raise ApiError(400, "new password must be 8..128 chars")
         if self.store.verify_password(user, old) is None:
             raise ApiError(403, "old password wrong")
         self.store.set_password(user, new)
+        # a password change ends every session except the one making it
+        keep = hashlib.sha256(keep_token.encode()).hexdigest()
+        for s in (self.store.user_dir(user) / "sessions").iterdir():
+            if s.name != keep:
+                s.unlink(missing_ok=True)
         return {"ok": True}
 
     # ---- queue -------------------------------------------------------------
@@ -690,6 +712,7 @@ class Api:
         if before and not MID_RE.match(before):
             raise ApiError(400, "bad 'before'")
         limit = max(1, min(limit, 200))
+        joined = self.store.joined_at(gid, user)
         out: list[dict] = []
         gdir = self.store.group_dir(gid)
         days = sorted((d for d in gdir.iterdir() if DATE_RE.match(d.name)),
@@ -697,6 +720,8 @@ class Api:
         for day in days:
             for mdir in sorted(day.iterdir(), reverse=True):
                 if not MID_RE.match(mdir.name):
+                    continue
+                if int(mdir.name[:13]) < joined:  # pre-join history is invisible
                     continue
                 if before and mdir.name >= before:
                     continue
@@ -717,16 +742,17 @@ class Api:
                 name = (gdir / "name").read_text()
             res.append({"gid": gid, "name": name,
                         "members": self.store.members(gid),
-                        "last": self._last_msg(gdir)})
+                        "last": self._last_msg(gdir,
+                                               self.store.joined_at(gid, user))})
         res.sort(key=lambda g: (g["last"] or {}).get("at", 0), reverse=True)
         return {"groups": res}
 
-    def _last_msg(self, gdir: Path) -> dict | None:
+    def _last_msg(self, gdir: Path, since: int = 0) -> dict | None:
         days = sorted((d for d in gdir.iterdir() if DATE_RE.match(d.name)),
                       key=lambda p: p.name, reverse=True)
         for day in days:
             for mdir in sorted(day.iterdir(), reverse=True):
-                if MID_RE.match(mdir.name):
+                if MID_RE.match(mdir.name) and int(mdir.name[:13]) >= since:
                     try:
                         text = (mdir / "message.txt").read_text()
                     except OSError:
@@ -774,6 +800,11 @@ class Api:
             if u != user:
                 raise ApiError(403, "members can only remove themselves")
             (md / u).unlink(missing_ok=True)
+            # leaving sweeps this group's entries out of the leaver's queue
+            for link in self.store.queue_dir(u).iterdir():
+                if (link.is_symlink()
+                        and self.store.gid_of(os.path.realpath(link)) == gid):
+                    link.unlink(missing_ok=True)
         return {"members": self.store.members(gid)}
 
     def list_users(self) -> dict:
@@ -884,8 +915,9 @@ class Handler(BaseHTTPRequestHandler):
                 api.store.drop_session(self._token)
                 return self._send_json({"ok": True})
             if p == ["password"]:
-                return self._send_json(api.change_password(self._user(),
-                                                           self._json_body()))
+                user = self._user()
+                return self._send_json(api.change_password(user, self._json_body(),
+                                                           self._token))
             if p == ["messages"]:
                 return self._send_json(api.send(self._user(), self._json_body()))
             if len(p) == 4 and p[:3] == ["message", "dequeue", "read"]:
