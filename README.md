@@ -1,0 +1,65 @@
+# internal-chat-server
+
+Minimal internal chat server: **one Python file, stdlib only, no database**.
+Messages are directories, flags are marker files, queues are folders of
+symlinks — every state change is a file appearing or moving. The full design
+(protocol, folder layout, security model) lives in the `internal-chat` repo's
+`DESIGN.md`; clients are `internal-chat-android` and `internal-chat-web`.
+
+## Quick start
+
+```bash
+# provision users (they must change the password on first login)
+python3 chatserver.py adduser alice --data /var/lib/internal-chat
+python3 chatserver.py adduser bob   --data /var/lib/internal-chat
+
+# TLS cert (internal CA or self-signed; clients pin it)
+openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+    -keyout server.pem -out server.pem -subj "/CN=chat.internal"
+
+# run (also serves the web client if --static points at internal-chat-web)
+python3 chatserver.py serve --data /var/lib/internal-chat \
+    --cert server.pem --port 8443 --static ./static --retain-days 0
+```
+
+Without `--cert` the server speaks plain HTTP and prints a loud warning —
+dev use only.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The suite starts the real server on a loopback port and drives the full flow:
+login → send → queue → dequeue (peek/confirm) → delivered + read flags →
+groups → attachment upload/download, plus authorization, validation,
+rate-limit, and upload-inertness checks.
+
+## The one-glance tour
+
+```
+data/
+├── incoming/                       # accepted, awaiting routing (the queue)
+├── users/<u>/queue/                # symlinks: new messages + flag events
+├── users/<u>/{staged,nonces,sessions,auth.json}
+├── groups/<gid>/members/<u>        # roster = marker files
+├── groups/<gid>/<date>/<msg-id>/   # message.txt, from, attachments/,
+│                                   # deliveredto/<u>, readby/<u>  (markers)
+└── {tmp,archive,rejected}/
+```
+
+A message's tick state is literally `ls`:
+
+```
+$ ls groups/d-alice-bob/2026-07-14/1784…-e6bb…/deliveredto readby
+deliveredto: bob        # ✓✓ arrived
+readby:      bob        # ✓✓ read (mtime = when)
+```
+
+## Deployment notes (see DESIGN.md §5/§9 for the full model)
+
+- Run as a dedicated non-root user; mount the data dir `noexec,nosuid,nodev`.
+- Suggested systemd hardening: `ProtectSystem=strict`, `NoNewPrivileges=yes`,
+  `ReadWritePaths=<data dir>`, `PrivateTmp=yes`.
+- Back up by snapshotting/rsyncing `data/` — it's only files.
