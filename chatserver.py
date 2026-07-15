@@ -30,7 +30,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 USER_RE = re.compile(r"^[a-z0-9_.-]{1,32}$")
 GID_RE = re.compile(r"^[gd]-[a-z0-9_.-]{1,72}$")
@@ -632,6 +632,13 @@ class Api:
             marker.parent.mkdir(exist_ok=True)
             if marker.exists():
                 continue
+            # read implies delivered: viewing before dequeue-confirm must
+            # still stamp the arrival flag first, or the tick order would lie
+            dmarker = mdir / "deliveredto" / user
+            dmarker.parent.mkdir(exist_ok=True)
+            if not dmarker.exists():
+                dmarker.touch()
+                self.store.queue_add(sender, f"{mid}~d~{user}", mdir)
             marker.touch()
             marked += 1
             self.store.queue_add(sender, f"{mid}~r~{user}", mdir)
@@ -1014,6 +1021,9 @@ class Handler(BaseHTTPRequestHandler):
                     rawname = rawname.encode("latin-1").decode("utf-8")
                 except (UnicodeDecodeError, UnicodeEncodeError):
                     pass
+                # browsers can only put ASCII in headers, so the web client
+                # percent-encodes; decoding is harmless for plain names
+                rawname = unquote(rawname)
                 return self._send_json(api.upload(user, self.rfile, length, rawname))
             if p == ["groups"]:
                 return self._send_json(api.create_group(self._user(),
@@ -1076,6 +1086,8 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, parts: list[str]) -> None:
         if self.static_dir is None:
             raise ApiError(404, "no web client installed")
+        if any(part.startswith(".") for part in parts):
+            raise ApiError(404, "not found")  # never serve dotfiles (.git etc.)
         base = self.static_dir.resolve()
         target = base.joinpath(*parts) if parts else base / "index.html"
         target = target.resolve()

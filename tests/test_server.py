@@ -434,6 +434,194 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["must_change"])  # reset forces a change
 
+    # ---- message-possibility unit tests (fresh users per test for isolation)
+
+    def fresh(self, *names):
+        for n in names:
+            self.store.add_user(n, "pw-" + n, must_change=False)
+            self.tokens[n] = self.login(n, "pw-" + n)["token"]
+
+    def upload(self, user, data, name="f.bin"):
+        status, up = self.req("POST", "/api/files", user=user, body=data,
+                              headers={"X-File-Name": name})
+        self.assertEqual(status, 200, up)
+        return up
+
+    def test_15_unicode_text_roundtrip(self):
+        self.fresh("t15a", "t15b")
+        text = "héllo 👋\nsecond line\ttab — dash"
+        mid = self.send_msg("t15a", text, to="t15b")["id"]
+        self.poll_until("t15b", lambda e: e["id"] == mid)
+        _, m = self.req("GET", f"/api/message/dequeue/{mid}", user="t15b")
+        self.assertEqual(m["text"], text)
+        self.confirm("t15b", [mid])
+
+    def test_16_file_only_and_empty_messages(self):
+        self.fresh("t16a", "t16b")
+        up = self.upload("t16a", b"PDFDATA", "doc.pdf")
+        sent = self.send_msg("t16a", "", to="t16b", files=[up["file_id"]])
+        self.poll_until("t16b", lambda e: e["id"] == sent["id"])
+        _, m = self.req("GET", f"/api/message/dequeue/{sent['id']}", user="t16b")
+        self.assertEqual(m["text"], "")
+        self.assertEqual(m["attachments"][0]["name"], "doc.pdf")
+        self.confirm("t16b", [sent["id"]])
+        # no text and no files is not a message; neither is whitespace
+        status, _ = self.req("POST", "/api/messages", user="t16a",
+                             body={"to": "t16b", "text": "   ", "nonce": "x" * 12})
+        self.assertEqual(status, 400)
+
+    def test_17_multiple_attachments_ordered(self):
+        self.fresh("t17a", "t17b")
+        blobs = [os.urandom(64) for _ in range(3)]
+        ups = [self.upload("t17a", b, f"f{i}.bin") for i, b in enumerate(blobs)]
+        sent = self.send_msg("t17a", "3 files", to="t17b",
+                             files=[u["file_id"] for u in ups])
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t17b", lambda e: e["id"] == mid)
+        _, m = self.req("GET", f"/api/message/dequeue/{mid}", user="t17b")
+        self.assertEqual([a["n"] for a in m["attachments"]], [1, 2, 3])
+        self.assertEqual([a["name"] for a in m["attachments"]],
+                         ["f0.bin", "f1.bin", "f2.bin"])
+        for i, blob in enumerate(blobs, 1):
+            r, data = self.req("GET", f"/api/attachments/{gid}/{mid}/{i}",
+                               user="t17b", raw=True)
+            self.assertEqual(data, blob, i)
+        self.confirm("t17b", [mid])
+
+    def test_18_attachment_errors(self):
+        self.fresh("t18a", "t18b")
+        up = self.upload("t18a", b"once", "once.bin")
+        first = self.send_msg("t18a", "uses it", to="t18b",
+                              files=[up["file_id"]])
+        # a staged id is consumed by the send that references it
+        status, _ = self.req("POST", "/api/messages", user="t18a",
+                             body={"to": "t18b", "text": "again",
+                                   "nonce": "n" * 12, "files": [up["file_id"]]})
+        self.assertEqual(status, 400)
+        # unknown (well-formed) id
+        status, _ = self.req("POST", "/api/messages", user="t18a",
+                             body={"to": "t18b", "text": "x", "nonce": "m" * 12,
+                                   "files": ["ab" * 16]})
+        self.assertEqual(status, 400)
+        # more than MAX_ATTACHMENTS references
+        status, _ = self.req("POST", "/api/messages", user="t18a",
+                             body={"to": "t18b", "text": "x", "nonce": "o" * 12,
+                                   "files": ["ab" * 16] * 9})
+        self.assertEqual(status, 400)
+        # attachment index out of range / absent
+        gid, mid = first["gid"], first["id"]
+        self.poll_until("t18b", lambda e: e["id"] == mid)
+        for n in ("0", "9", "2"):
+            status, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/{n}",
+                                 user="t18b")
+            self.assertIn(status, (400, 404), n)
+        self.confirm("t18b", [mid])
+
+    def test_19_text_and_nonce_limits(self):
+        self.fresh("t19a", "t19b")
+        self.assertTrue(self.send_msg("t19a", "x" * chatserver.MAX_TEXT,
+                                      to="t19b")["id"])
+        status, _ = self.req("POST", "/api/messages", user="t19a",
+                             body={"to": "t19b",
+                                   "text": "x" * (chatserver.MAX_TEXT + 1),
+                                   "nonce": "p" * 12})
+        self.assertEqual(status, 400)
+        for nonce in ("short", "", "bad nonce!", None):
+            body = {"to": "t19b", "text": "hi"}
+            if nonce is not None:
+                body["nonce"] = nonce
+            status, _ = self.req("POST", "/api/messages", user="t19a", body=body)
+            self.assertEqual(status, 400, repr(nonce))
+
+    def test_20_group_send_authz(self):
+        self.fresh("t20a", "t20b", "t20c")
+        _, g = self.req("POST", "/api/groups", user="t20a",
+                        body={"name": "closed", "members": ["t20b"]})
+        status, _ = self.req("POST", "/api/messages", user="t20c",
+                             body={"gid": g["gid"], "text": "let me in",
+                                   "nonce": "q" * 12})
+        self.assertEqual(status, 403)  # non-member cannot send
+        status, _ = self.req("POST", "/api/messages", user="t20a",
+                             body={"gid": "g-0123456789", "text": "x",
+                                   "nonce": "r" * 12})
+        self.assertEqual(status, 403)  # well-formed but nonexistent group
+        status, _ = self.req("POST", "/api/messages", user="t20a",
+                             body={"gid": "not-a-gid!", "text": "x",
+                                   "nonce": "s" * 12})
+        self.assertEqual(status, 400)  # malformed gid
+
+    def test_21_viewed_edge_cases(self):
+        self.fresh("t21a", "t21b", "t21c")
+        sent = self.send_msg("t21a", "look", to="t21b")
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t21b", lambda e: e["id"] == mid)
+        # sender viewing their own message is a no-op
+        status, r = self.req("POST", "/api/message/viewed", user="t21a",
+                             body={"gid": gid, "ids": [mid]})
+        self.assertEqual((status, r["marked"]), (200, 0))
+        # non-member is rejected
+        status, _ = self.req("POST", "/api/message/viewed", user="t21c",
+                             body={"gid": gid, "ids": [mid]})
+        self.assertEqual(status, 403)
+        # unknown mid is skipped, not an error
+        status, r = self.req("POST", "/api/message/viewed", user="t21b",
+                             body={"gid": gid,
+                                   "ids": [f"{10**12 + 5:013d}-{'a' * 12}"]})
+        self.assertEqual((status, r["marked"]), (200, 0))
+        # double-view marks exactly once
+        self.req("POST", "/api/message/viewed", user="t21b",
+                 body={"gid": gid, "ids": [mid]})
+        status, r = self.req("POST", "/api/message/viewed", user="t21b",
+                             body={"gid": gid, "ids": [mid]})
+        self.assertEqual(r["marked"], 0)
+
+    def test_22_read_implies_delivered(self):
+        self.fresh("t22a", "t22b")
+        sent = self.send_msg("t22a", "view first", to="t22b")
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t22b", lambda e: e["id"] == mid)
+        # view WITHOUT confirming the dequeue first
+        self.req("POST", "/api/message/viewed", user="t22b",
+                 body={"gid": gid, "ids": [mid]})
+        mdir = self.store.msg_dir(gid, mid)
+        self.assertTrue((mdir / "deliveredto" / "t22b").is_file())
+        self.assertTrue((mdir / "readby" / "t22b").is_file())
+        # sender gets both flag events, in order
+        d = self.poll_until("t22a", lambda e: e["entry"] == f"{mid}~d~t22b")
+        r = self.poll_until("t22a", lambda e: e["entry"] == f"{mid}~r~t22b")
+        self.confirm("t22a", [d["entry"], r["entry"]])
+        # the later dequeue-confirm is harmless: no duplicate ~d~
+        self.confirm("t22b", [mid])
+        self.assertEqual([e for e in self.poll("t22a", wait=0)
+                          if e["id"] == mid], [])
+
+    def test_23_queue_isolation_and_double_confirm(self):
+        self.fresh("t23a", "t23b", "t23c")
+        mid = self.send_msg("t23a", "for b only", to="t23b")["id"]
+        self.poll_until("t23b", lambda e: e["id"] == mid)
+        # a user cannot peek an entry that isn't in their own queue
+        status, _ = self.req("GET", f"/api/message/dequeue/{mid}", user="t23c")
+        self.assertEqual(status, 404)
+        # double confirm: the second is a counted no-op
+        self.assertEqual(self.confirm("t23b", [mid])["confirmed"], 1)
+        self.assertEqual(self.confirm("t23b", [mid])["confirmed"], 0)
+
+    def test_24_burst_ordering(self):
+        self.fresh("t24a", "t24b")
+        mids = [self.send_msg("t24a", f"m{i}", to="t24b")["id"]
+                for i in range(5)]
+        for m in mids:
+            self.poll_until("t24b", lambda e, m=m: e["id"] == m)
+        q = self.poll("t24b", wait=0)
+        entries = [e["entry"] for e in q if e["kind"] == "msg"]
+        self.assertEqual(entries, sorted(entries))  # queue is chronological
+        _, hist = self.req("GET", "/api/groups/d-t24a-t24b/messages",
+                           user="t24a")
+        ids = [m["id"] for m in hist["messages"]]
+        self.assertEqual(ids, sorted(ids, reverse=True))  # newest-first
+        self.assertTrue(set(mids) <= set(ids))
+        self.confirm("t24b", entries)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
