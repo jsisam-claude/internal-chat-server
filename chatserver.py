@@ -85,11 +85,27 @@ def mid_date(mid: str) -> str:
 
 def sanitize_filename(raw: str) -> str:
     """Original filenames are metadata only and never become paths, but they
-    are still displayed on clients — strip anything surprising."""
-    name = (raw or "").replace("\\", "/").rsplit("/", 1)[-1]
+    are still displayed on clients — strip anything surprising. Accepts the
+    raw header value: headers arrive latin-1, native clients send utf-8
+    bytes, browsers percent-encode."""
+    try:
+        raw = (raw or "").encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        raw = raw or ""
+    name = unquote(raw).replace("\\", "/").rsplit("/", 1)[-1]
     name = "".join(ch for ch in name if ch.isprintable() and ch not in '<>:"|?*')
     name = name.strip(". ")
     return name[:120] or "file"
+
+
+def msg_dirs_newest_first(gdir: Path):
+    """All message dirs of a group, newest first — the one directory-walk
+    used by history, previews, and recovery."""
+    for day in sorted((d for d in gdir.iterdir() if DATE_RE.match(d.name)),
+                      key=lambda p: p.name, reverse=True):
+        for mdir in sorted(day.iterdir(), reverse=True):
+            if MID_RE.match(mdir.name):
+                yield mdir
 
 
 class ApiError(Exception):
@@ -228,6 +244,10 @@ class Store:
     def is_member(self, gid: str, user: str) -> bool:
         return (self.group_dir(gid) / "members" / user).exists()
 
+    def group_name(self, gid: str) -> str | None:
+        f = self.group_dir(gid) / "name"
+        return f.read_text() if f.is_file() else None
+
     def joined_at(self, gid: str, user: str) -> int:
         """The membership marker's mtime IS the join timestamp; members only
         see history from their join onward (WhatsApp group semantics)."""
@@ -275,6 +295,14 @@ class Store:
             pass  # user deleted underneath us
 
     # ---- messages ----------------------------------------------------------
+    def _spool_dir(self, mid: str, gid: str, sender: str, text: str) -> Path:
+        b = self.root / "tmp" / f"m-{mid}"
+        (b / "attachments").mkdir(parents=True)
+        (b / "to").write_text(gid)
+        (b / "from").write_text(sender)
+        (b / "message.txt").write_text(text)
+        return b
+
     def spool_message(self, sender: str, gid: str, text: str,
                       staged: list[str], nonce: str) -> str:
         nf = self.user_dir(sender) / "nonces" / nonce
@@ -283,11 +311,7 @@ class Store:
         except FileNotFoundError:
             pass
         mid = self.next_mid()
-        b = self.root / "tmp" / f"m-{mid}"
-        (b / "attachments").mkdir(parents=True)
-        (b / "to").write_text(gid)
-        (b / "from").write_text(sender)
-        (b / "message.txt").write_text(text)
+        b = self._spool_dir(mid, gid, sender, text)
         for i, fid in enumerate(staged, 1):
             src = self.user_dir(sender) / "staged" / fid
             meta = self.user_dir(sender) / "staged" / (fid + ".meta")
@@ -306,11 +330,7 @@ class Store:
         about new groups and roster changes through the one queue they already
         poll. Only server code writes the marker — clients cannot inject it."""
         mid = self.next_mid()
-        b = self.root / "tmp" / f"m-{mid}"
-        (b / "attachments").mkdir(parents=True)
-        (b / "to").write_text(gid)
-        (b / "from").write_text(actor)
-        (b / "message.txt").write_text(text)
+        b = self._spool_dir(mid, gid, actor, text)
         (b / "system").write_text(json.dumps(event))
         os.replace(b, self.root / "incoming" / mid)
         return mid
@@ -413,21 +433,23 @@ class Router(threading.Thread):
 
     def _recover(self) -> None:
         """Finish messages that were renamed into a group but crashed before
-        their queue symlinks / .routed marker were created."""
+        their queue symlinks / .routed marker were created. Only the last two
+        days can be affected, so stop the newest-first walk there."""
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=2)).strftime("%Y-%m-%d")
         for gdir in (self.store.root / "groups").iterdir():
-            days = sorted((d.name for d in gdir.iterdir() if DATE_RE.match(d.name)),
-                          reverse=True)[:2]
-            for day in days:
-                for mdir in (gdir / day).iterdir():
-                    if not MID_RE.match(mdir.name) or (mdir / ".routed").exists():
-                        continue
-                    try:
-                        sender = (mdir / "from").read_text().strip()
-                        self._finish(mdir, mdir.name, sender,
-                                     self.store.members(gdir.name))
-                        log(f"router: recovered {mdir.name}")
-                    except Exception as e:
-                        log(f"router: recovery failed for {mdir}: {e}")
+            for mdir in msg_dirs_newest_first(gdir):
+                if mdir.parent.name < cutoff:
+                    break
+                if (mdir / ".routed").exists():
+                    continue
+                try:
+                    sender = (mdir / "from").read_text().strip()
+                    self._finish(mdir, mdir.name, sender,
+                                 self.store.members(gdir.name))
+                    log(f"router: recovered {mdir.name}")
+                except Exception as e:
+                    log(f"router: recovery failed for {mdir}: {e}")
 
 
 class Janitor(threading.Thread):
@@ -581,6 +603,24 @@ class Api:
             raise ApiError(404, "message gone")
         return self.render_msg(mdir)
 
+    def _stamp(self, mdir: Path, user: str, kind: str) -> bool:
+        """One code path for both flags: create the marker and queue the
+        matching ~d~/~r~ event to the sender. Keeps 'read implies delivered'
+        and 'no ticks on system announcements or own messages' in one place.
+        Returns True if the marker was new."""
+        marker = mdir / ("readby" if kind == "r" else "deliveredto") / user
+        marker.parent.mkdir(exist_ok=True)
+        if marker.exists():
+            return False
+        if kind == "r":
+            self._stamp(mdir, user, "d")
+        marker.touch()
+        sender = (mdir / "from").read_text().strip()
+        if sender != user and not (mdir / "system").exists():
+            self.store.queue_add(sender, f"{mdir.name}~{kind}~{user}", mdir)
+            self.notifier.notify(sender)
+        return True
+
     def confirm(self, user: str, entries: list[str]) -> dict:
         """Dequeue-confirm: remove queue symlinks; for message entries also
         stamp the arrival flag and queue a ~d~ event to the sender."""
@@ -588,23 +628,14 @@ class Api:
         for name in entries[:500]:
             m = ENTRY_RE.match(name)
             if not m:
-                raise ApiError(400, f"bad queue entry")
+                raise ApiError(400, "bad queue entry")
             link = self.store.queue_dir(user) / name
             if not link.is_symlink():
                 continue
-            mid, kind, _ = m.groups()
-            if kind is None:
+            if m.group(2) is None:  # a message entry, not a flag event
                 mdir = Path(os.path.realpath(link))
                 if self.store.gid_of(mdir) and mdir.is_dir():
-                    marker = mdir / "deliveredto" / user
-                    marker.parent.mkdir(exist_ok=True)
-                    if not marker.exists():
-                        marker.touch()
-                        sender = (mdir / "from").read_text().strip()
-                        # no ticks on system announcements
-                        if sender != user and not (mdir / "system").exists():
-                            self.store.queue_add(sender, f"{mid}~d~{user}", mdir)
-                            self.notifier.notify(sender)
+                    self._stamp(mdir, user, "d")
             link.unlink(missing_ok=True)
             confirmed += 1
         return {"confirmed": confirmed}
@@ -628,21 +659,8 @@ class Api:
             sender = (mdir / "from").read_text().strip()
             if sender == user or (mdir / "system").exists():
                 continue
-            marker = mdir / "readby" / user
-            marker.parent.mkdir(exist_ok=True)
-            if marker.exists():
-                continue
-            # read implies delivered: viewing before dequeue-confirm must
-            # still stamp the arrival flag first, or the tick order would lie
-            dmarker = mdir / "deliveredto" / user
-            dmarker.parent.mkdir(exist_ok=True)
-            if not dmarker.exists():
-                dmarker.touch()
-                self.store.queue_add(sender, f"{mid}~d~{user}", mdir)
-            marker.touch()
-            marked += 1
-            self.store.queue_add(sender, f"{mid}~r~{user}", mdir)
-            self.notifier.notify(sender)
+            if self._stamp(mdir, user, "r"):
+                marked += 1
         return {"marked": marked}
 
     # ---- sending -----------------------------------------------------------
@@ -773,20 +791,14 @@ class Api:
         limit = max(1, min(limit, 200))
         joined = self.store.joined_at(gid, user)
         out: list[dict] = []
-        gdir = self.store.group_dir(gid)
-        days = sorted((d for d in gdir.iterdir() if DATE_RE.match(d.name)),
-                      key=lambda p: p.name, reverse=True)
-        for day in days:
-            for mdir in sorted(day.iterdir(), reverse=True):
-                if not MID_RE.match(mdir.name):
-                    continue
-                if int(mdir.name[:13]) < joined:  # pre-join history is invisible
-                    continue
-                if before and mdir.name >= before:
-                    continue
-                out.append(self.render_msg(mdir))
-                if len(out) >= limit:
-                    return {"messages": out}
+        for mdir in msg_dirs_newest_first(self.store.group_dir(gid)):
+            if int(mdir.name[:13]) < joined:
+                break  # newest-first: everything after this predates the join
+            if before and mdir.name >= before:
+                continue
+            out.append(self.render_msg(mdir))
+            if len(out) >= limit:
+                break
         return {"messages": out}
 
     # ---- groups / directory --------------------------------------------------
@@ -796,10 +808,7 @@ class Api:
             if not (gdir / "members" / user).exists():
                 continue
             gid = gdir.name
-            name = None
-            if (gdir / "name").is_file():
-                name = (gdir / "name").read_text()
-            res.append({"gid": gid, "name": name,
+            res.append({"gid": gid, "name": self.store.group_name(gid),
                         "members": self.store.members(gid),
                         "last": self._last_msg(gdir,
                                                self.store.joined_at(gid, user))})
@@ -807,19 +816,17 @@ class Api:
         return {"groups": res}
 
     def _last_msg(self, gdir: Path, since: int = 0) -> dict | None:
-        days = sorted((d for d in gdir.iterdir() if DATE_RE.match(d.name)),
-                      key=lambda p: p.name, reverse=True)
-        for day in days:
-            for mdir in sorted(day.iterdir(), reverse=True):
-                if MID_RE.match(mdir.name) and int(mdir.name[:13]) >= since:
-                    try:
-                        text = (mdir / "message.txt").read_text()
-                    except OSError:
-                        continue
-                    return {"id": mdir.name, "at": int(mdir.name[:13]),
-                            "from": (mdir / "from").read_text().strip(),
-                            "text": text[:80],
-                            "attachments": len(list((mdir / "attachments").glob("*.meta")))}
+        for mdir in msg_dirs_newest_first(gdir):
+            if int(mdir.name[:13]) < since:
+                return None
+            try:
+                text = (mdir / "message.txt").read_text()
+            except OSError:
+                continue
+            return {"id": mdir.name, "at": int(mdir.name[:13]),
+                    "from": (mdir / "from").read_text().strip(),
+                    "text": text[:80],
+                    "attachments": len(list((mdir / "attachments").glob("*.meta")))}
         return None
 
     def create_group(self, user: str, body: dict) -> dict:
@@ -888,9 +895,8 @@ class Api:
             raise ApiError(400, "bad group id")
         if not self.store.is_member(gid, user):
             raise ApiError(403, "not a member")
-        gdir = self.store.group_dir(gid)
-        name = (gdir / "name").read_text() if (gdir / "name").is_file() else None
-        return {"gid": gid, "name": name, "members": self.store.members(gid),
+        return {"gid": gid, "name": self.store.group_name(gid),
+                "members": self.store.members(gid),
                 "joined_at": self.store.joined_at(gid, user)}
 
     def list_users(self) -> dict:
@@ -1016,15 +1022,9 @@ class Handler(BaseHTTPRequestHandler):
                     length = int(self.headers.get("Content-Length") or 0)
                 except ValueError:
                     length = 0
-                rawname = self.headers.get("X-File-Name", "file")
-                try:  # header arrives latin-1; clients send utf-8 bytes
-                    rawname = rawname.encode("latin-1").decode("utf-8")
-                except (UnicodeDecodeError, UnicodeEncodeError):
-                    pass
-                # browsers can only put ASCII in headers, so the web client
-                # percent-encodes; decoding is harmless for plain names
-                rawname = unquote(rawname)
-                return self._send_json(api.upload(user, self.rfile, length, rawname))
+                return self._send_json(api.upload(
+                    user, self.rfile, length,
+                    self.headers.get("X-File-Name", "file")))
             if p == ["groups"]:
                 return self._send_json(api.create_group(self._user(),
                                                         self._json_body()))
