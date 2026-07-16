@@ -1,0 +1,36 @@
+[Unit]
+Description=internal chat server (folder-queue, stdlib-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=internal-chat
+Group=internal-chat
+ExecStart=/usr/bin/python3 /opt/internal-chat/chatserver.py serve \
+    --data /var/lib/internal-chat \
+    --cert /etc/internal-chat/server.pem \
+    --static /opt/internal-chat/static \
+    --port 8443 --retain-days 0
+Restart=on-failure
+RestartSec=3
+
+# Sandboxing per DESIGN.md: uploads must never be executable or reachable
+# as anything but opaque bytes, and the service owns nothing but its data.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/internal-chat
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
