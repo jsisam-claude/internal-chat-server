@@ -1,10 +1,35 @@
 # internal-chat-server
 
-Minimal internal chat server: **one Python file, stdlib only, no database**.
+Minimal internal chat server: **stdlib only, no database, no dependencies**.
 Messages are directories, flags are marker files, queues are folders of
 symlinks — every state change is a file appearing or moving. The full design
 (protocol, folder layout, security model) lives in the `internal-chat` repo's
 `DESIGN.md`; clients are `internal-chat-android` and `internal-chat-web`.
+
+## Layout
+
+`chatserver.py` is the runnable entry point; the implementation is a small
+package so each concern is in its own file:
+
+```
+chatserver.py          run this (or `python3 -m internalchat`)
+internalchat/
+├── config.py          limits, regexes, CSP, static-type table
+├── errors.py          ApiError — the one raised type
+├── util.py            stateless helpers (ids, filenames, dir walks, logging)
+├── store.py           Store — the on-disk data model (folders/markers/symlinks)
+├── notifier.py        per-user wakeups for long-polling
+├── ratelimit.py       bounded sliding-window rate limiter
+├── router.py          Router (routes + fans out messages) + Janitor (retention)
+├── api.py             Api — all request-handling logic, HTTP-independent
+├── server.py          the HTTP handler + build_server() wiring
+└── cli.py             serve / adduser / passwd command line
+```
+
+Data flows one way: `server.py` parses a request → calls an `api.py` method →
+which reads/writes through `store.py`; the `router.py` thread moves messages
+between queues in the background. `chatserver.py` re-exports the package's
+public names, so `import chatserver` keeps working.
 
 ## Quick start
 

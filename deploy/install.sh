@@ -30,6 +30,10 @@ id "$SVCUSER" >/dev/null 2>&1 || \
 
 mkdir -p "$APP" "$ETC" "$DATA"
 install -m 0644 chatserver.py "$APP/chatserver.py"
+# the implementation lives in the internalchat/ package next to the entry point
+rm -rf "$APP/internalchat"
+mkdir -p "$APP/internalchat"
+install -m 0644 internalchat/*.py "$APP/internalchat/"
 if [ -n "$WEB" ]; then
     mkdir -p "$APP/static"
     # copy only what the client needs; never dotfiles or repo metadata
