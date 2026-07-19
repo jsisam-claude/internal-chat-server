@@ -26,6 +26,9 @@ class ChatServerTest(unittest.TestCase):
             cls.store.add_user(u, "pw-" + u, must_change=False)
         cls.httpd, cls.router, cls.api = chatserver.build_server(
             cls.store, "127.0.0.1", 0)
+        # every test logs in from 127.0.0.1, so the per-IP login cap (a real
+        # production defense) would otherwise trip mid-suite; lift it for tests.
+        cls.api.login_ip_limiter.limit = 1_000_000
         cls.port = cls.httpd.server_address[1]
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
         cls.tokens = {u: cls.login(u, "pw-" + u)["token"]
@@ -248,11 +251,16 @@ class ChatServerTest(unittest.TestCase):
             status, _ = self.req("GET", path, user="alice")
             self.assertIn(status, (400, 404), path)
 
-        # bad login + rate limiting
+        # bad login + per-user rate limiting (throwaway user so this doesn't
+        # leave a shared account's login limiter saturated for later tests)
+        seen = set()
         for i in range(12):
             status, _ = self.req("POST", "/api/login",
-                                 body={"user": "carol", "password": "wrong"})
+                                 body={"user": "ratelimitprobe",
+                                       "password": "wrong"})
+            seen.add(status)
         self.assertEqual(status, 429)
+        self.assertIn(401, seen)  # first attempts are auth failures, not 429
 
         # messaging yourself or unknown users
         status, _ = self.req("POST", "/api/messages", user="alice",
@@ -586,9 +594,14 @@ class ChatServerTest(unittest.TestCase):
         mdir = self.store.msg_dir(gid, mid)
         self.assertTrue((mdir / "deliveredto" / "t22b").is_file())
         self.assertTrue((mdir / "readby" / "t22b").is_file())
-        # sender gets both flag events, in order
+        # sender gets both flag events, and delivered sorts before read
         d = self.poll_until("t22a", lambda e: e["entry"] == f"{mid}~d~t22b")
         r = self.poll_until("t22a", lambda e: e["entry"] == f"{mid}~r~t22b")
+        q = self.poll("t22a", wait=0)
+        order = [e["entry"] for e in q if e["id"] == mid]
+        self.assertEqual(order, sorted(order))  # queue is chronological
+        self.assertLess(order.index(f"{mid}~d~t22b"),
+                        order.index(f"{mid}~r~t22b"))  # delivered before read
         self.confirm("t22a", [d["entry"], r["entry"]])
         # the later dequeue-confirm is harmless: no duplicate ~d~
         self.confirm("t22b", [mid])
@@ -720,6 +733,31 @@ class ChatServerTest(unittest.TestCase):
         m = next(x for x in hist["messages"] if x["id"] == mid)
         self.assertEqual(m["recipients"], ["t32b"])  # carol excluded (joined later)
         self.confirm("t32b", [mid])
+
+    def test_33_failed_send_releases_nonce(self):
+        # a send that aborts (bad file id) must release its nonce claim, so a
+        # corrected retry with the SAME nonce succeeds instead of returning a
+        # phantom id for a message that was never spooled
+        self.fresh("t33a", "t33b")
+        nonce = "reuse-nonce-33xx"
+        status, _ = self.req("POST", "/api/messages", user="t33a",
+                             body={"to": "t33b", "text": "x", "nonce": nonce,
+                                   "files": ["ab" * 16]})
+        self.assertEqual(status, 400)
+        # same nonce, now valid: must actually create and deliver a message
+        status, resp = self.req("POST", "/api/messages", user="t33a",
+                                body={"to": "t33b", "text": "fixed",
+                                      "nonce": nonce})
+        self.assertEqual(status, 200)
+        ev = self.poll_until("t33b", lambda e: e["id"] == resp["id"])
+        _, m = self.req("GET", f"/api/message/dequeue/{resp['id']}", user="t33b")
+        self.assertEqual(m["text"], "fixed")
+        self.confirm("t33b", [ev["entry"]])
+        # and a genuine retry of the successful send dedups to the same id
+        status, again = self.req("POST", "/api/messages", user="t33a",
+                                 body={"to": "t33b", "text": "fixed",
+                                       "nonce": nonce})
+        self.assertEqual(again["id"], resp["id"])
 
 
 if __name__ == "__main__":

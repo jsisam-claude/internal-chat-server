@@ -348,45 +348,50 @@ class Store:
     def spool_message(self, sender: str, gid: str, text: str,
                       staged: list[str], nonce: str) -> str:
         nf = self.user_dir(sender) / "nonces" / nonce
-        mid = self.next_mid()
-        # Claim the nonce atomically BEFORE any work. The first caller wins and
-        # builds the message; a concurrent or later retry finds the claim and
-        # returns the original mid without rebuilding — so staged files are
-        # never double-consumed and no duplicate message with a new mid appears.
+        # Claim the nonce atomically as an EMPTY file before any work. The mid
+        # is written into it only after the message is durably spooled, so a
+        # concurrent/later retry either (a) reads the mid and returns it — no
+        # duplicate, no double-consumed attachments — or (b) sees the claim
+        # released because the first attempt aborted, and retries cleanly.
         try:
-            fd = os.open(nf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(os.open(nf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         except FileExistsError:
             return self._await_nonce(nf)
-        os.write(fd, mid.encode())
-        os.close(fd)
-
-        udir = self.user_dir(sender)
-        # Validate every staged input before moving ANY, so a bad/expired id in
-        # the list can't destroy attachments already moved for earlier ids.
-        srcs = []
-        for fid in staged:
-            src, meta = udir / "staged" / fid, udir / "staged" / (fid + ".meta")
-            if not (src.is_file() and meta.is_file()):
-                nf.unlink(missing_ok=True)  # release claim so a fixed retry works
-                raise ApiError(400, "unknown file id (upload first)")
-            srcs.append((src, meta))
-        b = self._spool_dir(mid, gid, sender, text)
         try:
-            for i, (src, meta) in enumerate(srcs, 1):
-                os.replace(src, b / "attachments" / str(i))
-                os.replace(meta, b / "attachments" / f"{i}.meta")
-            os.replace(b, self.root / "incoming" / mid)
-        except OSError:  # janitor pruned a staged file mid-move, or fs error
-            shutil.rmtree(b, ignore_errors=True)
-            nf.unlink(missing_ok=True)
-            raise ApiError(503, "send failed, please retry")
+            mid = self.next_mid()
+            udir = self.user_dir(sender)
+            # Validate every staged input before moving ANY, so a bad/expired
+            # id can't destroy attachments already moved for earlier ids.
+            srcs = []
+            for fid in staged:
+                src = udir / "staged" / fid
+                meta = udir / "staged" / (fid + ".meta")
+                if not (src.is_file() and meta.is_file()):
+                    raise ApiError(400, "unknown file id (upload first)")
+                srcs.append((src, meta))
+            b = self._spool_dir(mid, gid, sender, text)
+            try:
+                for i, (src, meta) in enumerate(srcs, 1):
+                    os.replace(src, b / "attachments" / str(i))
+                    os.replace(meta, b / "attachments" / f"{i}.meta")
+                os.replace(b, self.root / "incoming" / mid)
+            except OSError:  # janitor pruned a staged file mid-move, or fs error
+                shutil.rmtree(b, ignore_errors=True)
+                raise ApiError(503, "send failed, please retry")
+        except Exception:
+            nf.unlink(missing_ok=True)  # release the claim so a retry can work
+            raise
+        self.write_atomic(nf, mid.encode())  # publish the mid last
         return mid
 
     def _await_nonce(self, nf: Path) -> str:
-        """A concurrent retry may find the nonce claimed but not yet filled
-        with its mid (tiny window). Re-read briefly."""
-        for _ in range(50):
-            mid = nf.read_text() if nf.is_file() else ""
+        """A concurrent request holds the claim. Wait for it to fill the nonce
+        with its mid (dedup), or for it to release the claim on failure (in
+        which case the caller should retry)."""
+        for _ in range(100):
+            if not nf.exists():
+                raise ApiError(503, "send failed, please retry")  # claimer aborted
+            mid = nf.read_text()
             if mid:
                 return mid
             time.sleep(0.01)
