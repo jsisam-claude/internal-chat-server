@@ -52,9 +52,17 @@ MAX_WAIT = 30
 MAX_GROUP_MEMBERS = 64
 SESSION_IDLE_DAYS = 30
 PBKDF2_ITERS = 600_000
+# Abuse limits (an authenticated internal user may be malicious):
+SEND_LIMIT = 60          # messages per SEND_WINDOW per user
+SEND_WINDOW = 60
+UPLOAD_LIMIT = 30        # uploads per UPLOAD_WINDOW per user
+UPLOAD_WINDOW = 60
+LOGIN_IP_LIMIT = 60      # login attempts per 5 min per source IP (any username)
+USER_STORAGE_QUOTA = 2 * 1024 * 1024 * 1024   # 2 GB of attachments per user
 
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
-       "connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'")
+       "connect-src 'self'; img-src 'self'; base-uri 'none'; "
+       "form-action 'none'; frame-ancestors 'none'")
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -103,7 +111,11 @@ def msg_dirs_newest_first(gdir: Path):
     used by history, previews, and recovery."""
     for day in sorted((d for d in gdir.iterdir() if DATE_RE.match(d.name)),
                       key=lambda p: p.name, reverse=True):
-        for mdir in sorted(day.iterdir(), reverse=True):
+        try:
+            entries = sorted(day.iterdir(), reverse=True)
+        except FileNotFoundError:
+            continue  # janitor archived this day folder mid-walk
+        for mdir in entries:
             if MID_RE.match(mdir.name):
                 yield mdir
 
@@ -123,16 +135,28 @@ class Store:
         self.root = Path(root).resolve()
         self.iters = iters
         self._id_lock = threading.Lock()
-        self._last_ms = 0
         for name in ("tmp", "incoming", "users", "groups", "archive", "rejected"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
+        # High-water mark for the message-id clock, persisted so a restart
+        # after an NTP step back still issues strictly increasing ids.
+        self._hwm_path = self.root / "id_hwm"
+        try:
+            self._last_ms = int(self._hwm_path.read_text())
+        except (OSError, ValueError):
+            self._last_ms = 0
 
     def next_mid(self) -> str:
-        """Sorted listings are the timeline, so ids must never go backwards —
-        even if NTP steps the clock. Monotonic within this process."""
+        """Sorted listings are the timeline, so ids must be STRICTLY
+        increasing — even across a restart or an NTP step back. The high-water
+        mark is persisted, and each id is at least the previous + 1ms, so two
+        sends never share a timestamp prefix (deterministic ordering)."""
         with self._id_lock:
-            ms = max(now_ms(), self._last_ms)
+            ms = max(now_ms(), self._last_ms + 1)
             self._last_ms = ms
+            try:
+                self.write_atomic(self._hwm_path, str(ms).encode())
+            except OSError:
+                pass  # persistence is best-effort; ordering still holds in-process
         return f"{ms:013d}-{secrets.token_hex(6)}"
 
     # ---- paths -----------------------------------------------------------
@@ -224,7 +248,10 @@ class Store:
             p.unlink(missing_ok=True)
             return None
         if age > 3600:  # mtime = last use, refreshed at most hourly
-            os.utime(p)
+            try:
+                os.utime(p)
+            except OSError:
+                return None  # session revoked concurrently (logout/passwd)
         return user
 
     def drop_session(self, token: str) -> None:
@@ -278,9 +305,24 @@ class Store:
                 return gid
 
     def ensure_dm(self, a: str, b: str) -> str:
+        """Deterministic DM id. Usernames may contain '-', so the readable
+        'd-<a>-<b>' form can collide for distinct pairs (e.g. {a,b-c} and
+        {a-b,c}). The common case keeps the readable id; on an actual collision
+        (existing group whose members differ) we fall back to a hash-suffixed
+        id so the second pair still gets its own DM instead of a 403."""
+        want = {a, b}
         gid = "d-" + "-".join(sorted((a, b)))
+        gdir = self.group_dir(gid)
+        if not gdir.exists():
+            if self._publish_group(gid, "", want):
+                return gid
+        if set(self.members(gid)) == want:
+            return gid
+        # collision: disambiguate with a stable hash of the exact pair
+        h = hashlib.sha256("\x00".join(sorted(want)).encode()).hexdigest()[:12]
+        gid = f"d-{h}"
         if not self.group_dir(gid).exists():
-            self._publish_group(gid, "", {a, b})
+            self._publish_group(gid, "", want)
         return gid
 
     # ---- queue -------------------------------------------------------------
@@ -306,23 +348,49 @@ class Store:
     def spool_message(self, sender: str, gid: str, text: str,
                       staged: list[str], nonce: str) -> str:
         nf = self.user_dir(sender) / "nonces" / nonce
-        try:
-            return nf.read_text()  # retried send: same nonce -> same message
-        except FileNotFoundError:
-            pass
         mid = self.next_mid()
-        b = self._spool_dir(mid, gid, sender, text)
-        for i, fid in enumerate(staged, 1):
-            src = self.user_dir(sender) / "staged" / fid
-            meta = self.user_dir(sender) / "staged" / (fid + ".meta")
+        # Claim the nonce atomically BEFORE any work. The first caller wins and
+        # builds the message; a concurrent or later retry finds the claim and
+        # returns the original mid without rebuilding — so staged files are
+        # never double-consumed and no duplicate message with a new mid appears.
+        try:
+            fd = os.open(nf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return self._await_nonce(nf)
+        os.write(fd, mid.encode())
+        os.close(fd)
+
+        udir = self.user_dir(sender)
+        # Validate every staged input before moving ANY, so a bad/expired id in
+        # the list can't destroy attachments already moved for earlier ids.
+        srcs = []
+        for fid in staged:
+            src, meta = udir / "staged" / fid, udir / "staged" / (fid + ".meta")
             if not (src.is_file() and meta.is_file()):
-                shutil.rmtree(b, ignore_errors=True)
+                nf.unlink(missing_ok=True)  # release claim so a fixed retry works
                 raise ApiError(400, "unknown file id (upload first)")
-            os.replace(src, b / "attachments" / str(i))
-            os.replace(meta, b / "attachments" / f"{i}.meta")
-        os.replace(b, self.root / "incoming" / mid)
-        self.write_atomic(nf, mid.encode())
+            srcs.append((src, meta))
+        b = self._spool_dir(mid, gid, sender, text)
+        try:
+            for i, (src, meta) in enumerate(srcs, 1):
+                os.replace(src, b / "attachments" / str(i))
+                os.replace(meta, b / "attachments" / f"{i}.meta")
+            os.replace(b, self.root / "incoming" / mid)
+        except OSError:  # janitor pruned a staged file mid-move, or fs error
+            shutil.rmtree(b, ignore_errors=True)
+            nf.unlink(missing_ok=True)
+            raise ApiError(503, "send failed, please retry")
         return mid
+
+    def _await_nonce(self, nf: Path) -> str:
+        """A concurrent retry may find the nonce claimed but not yet filled
+        with its mid (tiny window). Re-read briefly."""
+        for _ in range(50):
+            mid = nf.read_text() if nf.is_file() else ""
+            if mid:
+                return mid
+            time.sleep(0.01)
+        raise ApiError(503, "send in progress, please retry")
 
     def spool_system(self, actor: str, gid: str, text: str, event: dict) -> str:
         """Group lifecycle (created/join/leave) is announced in-band: a system
@@ -433,16 +501,19 @@ class Router(threading.Thread):
 
     def _recover(self) -> None:
         """Finish messages that were renamed into a group but crashed before
-        their queue symlinks / .routed marker were created. Only the last two
-        days can be affected, so stop the newest-first walk there."""
-        cutoff = (datetime.now(timezone.utc)
-                  - timedelta(days=2)).strftime("%Y-%m-%d")
+        their queue symlinks / .routed marker were created.
+
+        The single router thread drains incoming/ in id order and routes one
+        message at a time (rename, then _finish), so at most one message per
+        group can be mid-route at a crash, and it is among the NEWEST in that
+        group. We therefore walk each group newest-first and stop at the first
+        already-.routed message — O(groups) work, correct regardless of how
+        long the outage lasted (no wall-clock cutoff, which was measured from
+        the wrong instant)."""
         for gdir in (self.store.root / "groups").iterdir():
             for mdir in msg_dirs_newest_first(gdir):
-                if mdir.parent.name < cutoff:
-                    break
                 if (mdir / ".routed").exists():
-                    continue
+                    break  # everything older in this group is finished
                 try:
                     sender = (mdir / "from").read_text().strip()
                     self._finish(mdir, mdir.name, sender,
@@ -453,11 +524,13 @@ class Router(threading.Thread):
 
 
 class Janitor(threading.Thread):
-    def __init__(self, store: Store, retain_days: int = 0, interval: float = 3600):
+    def __init__(self, store: Store, retain_days: int = 0, interval: float = 3600,
+                 limiters: list | None = None):
         super().__init__(daemon=True, name="janitor")
         self.store = store
         self.retain_days = retain_days
         self.interval = interval
+        self.limiters = limiters or []
         self.stopping = threading.Event()
 
     def run(self) -> None:
@@ -469,6 +542,8 @@ class Janitor(threading.Thread):
 
     def clean(self) -> None:
         now = time.time()
+        for lim in self.limiters:
+            lim.sweep()  # release rate-limiter memory for idle keys
 
         def prune(folder: Path, max_age: float, dirs: bool = False) -> None:
             try:
@@ -509,19 +584,38 @@ class Janitor(threading.Thread):
 
 
 class RateLimiter:
-    def __init__(self, limit: int = 10, window: float = 300):
-        self.limit, self.window = limit, window
+    """Sliding-window limiter. Keys are evicted once their window empties and
+    the whole table is capped, so an attacker cannot grow the process heap by
+    sending an endless stream of distinct keys (e.g. unknown usernames)."""
+
+    def __init__(self, limit: int = 10, window: float = 300,
+                 max_keys: int = 20_000):
+        self.limit, self.window, self.max_keys = limit, window, max_keys
         self._lock = threading.Lock()
         self._hits: dict[str, list[float]] = {}
 
     def check(self, key: str) -> None:
         now = time.time()
         with self._lock:
+            if key not in self._hits and len(self._hits) >= self.max_keys:
+                # table full: drop every key whose window has fully expired
+                for k in [k for k, v in self._hits.items()
+                          if not v or now - v[-1] >= self.window]:
+                    del self._hits[k]
             q = self._hits.setdefault(key, [])
             q[:] = [t for t in q if now - t < self.window]
             if len(q) >= self.limit:
                 raise ApiError(429, "too many attempts, slow down")
             q.append(now)
+
+    def sweep(self) -> None:
+        """Drop empty/expired keys — called periodically by the janitor so an
+        idle server releases limiter memory even below max_keys."""
+        now = time.time()
+        with self._lock:
+            for k in [k for k, v in self._hits.items()
+                      if not v or now - v[-1] >= self.window]:
+                del self._hits[k]
 
 
 class Api:
@@ -532,6 +626,11 @@ class Api:
         self.notifier = notifier
         self.router = router
         self.login_limiter = RateLimiter(limit=10, window=300)
+        self.login_ip_limiter = RateLimiter(limit=LOGIN_IP_LIMIT, window=300)
+        self.send_limiter = RateLimiter(limit=SEND_LIMIT, window=SEND_WINDOW)
+        self.upload_limiter = RateLimiter(limit=UPLOAD_LIMIT, window=UPLOAD_WINDOW)
+        self.limiters = [self.login_limiter, self.login_ip_limiter,
+                         self.send_limiter, self.upload_limiter]
 
     # ---- auth --------------------------------------------------------------
     def login(self, ip: str, body: dict) -> dict:
@@ -540,7 +639,8 @@ class Api:
         if not (isinstance(user, str) and isinstance(password, str)
                 and USER_RE.match(user)):
             raise ApiError(400, "bad credentials")
-        self.login_limiter.check(f"{ip}/{user}")
+        self.login_ip_limiter.check(ip)          # caps distinct-username floods
+        self.login_limiter.check(f"{ip}/{user}")  # caps guessing one account
         auth = self.store.verify_password(user, password)
         if auth is None:
             raise ApiError(401, "bad credentials")
@@ -576,17 +676,23 @@ class Api:
             m = ENTRY_RE.match(link.name)
             if not m or not link.is_symlink():
                 continue
-            mid, kind, uid = m.groups()
-            target = Path(os.path.realpath(link))
-            gid = self.store.gid_of(target)
-            if kind is None and not target.is_dir():
-                link.unlink(missing_ok=True)  # target archived/gone: drop
+            # A second device (or the janitor) may unlink this entry between
+            # our checks; treat any such disappearance as "gone" rather than
+            # letting a FileNotFoundError 500 the whole long-poll.
+            try:
+                mid, kind, uid = m.groups()
+                target = Path(os.path.realpath(link))
+                gid = self.store.gid_of(target)
+                if kind is None and not target.is_dir():
+                    link.unlink(missing_ok=True)  # target archived/gone: drop
+                    continue
+                at = int(link.lstat().st_mtime * 1000)
+            except FileNotFoundError:
                 continue
             item = {"entry": link.name,
                     "kind": {"d": "delivered", "r": "read", "x": "failed",
                              None: "msg"}[kind],
-                    "id": mid, "gid": gid,
-                    "at": int(link.lstat().st_mtime * 1000)}
+                    "id": mid, "gid": gid, "at": at}
             if uid:
                 item["user"] = uid
             out.append(item)
@@ -599,8 +705,15 @@ class Api:
         if not link.is_symlink():
             raise ApiError(404, "not in your queue")
         mdir = Path(os.path.realpath(link))
-        if self.store.gid_of(mdir) is None or not mdir.is_dir():
+        gid = self.store.gid_of(mdir)
+        if gid is None or not mdir.is_dir():
             raise ApiError(404, "message gone")
+        # A queue entry can outlive membership if a stale symlink survives a
+        # leave (or a router/leave race), so authorize on live membership too —
+        # never serve message content for a group the user is not in.
+        if not self.store.is_member(gid, user):
+            link.unlink(missing_ok=True)
+            raise ApiError(403, "not a member")
         return self.render_msg(mdir)
 
     def _stamp(self, mdir: Path, user: str, kind: str) -> bool:
@@ -634,7 +747,10 @@ class Api:
                 continue
             if m.group(2) is None:  # a message entry, not a flag event
                 mdir = Path(os.path.realpath(link))
-                if self.store.gid_of(mdir) and mdir.is_dir():
+                gid = self.store.gid_of(mdir)
+                # only stamp delivered if the user is genuinely still a member;
+                # a stale entry for a left group is just unlinked
+                if gid and mdir.is_dir() and self.store.is_member(gid, user):
                     self._stamp(mdir, user, "d")
             link.unlink(missing_ok=True)
             confirmed += 1
@@ -689,6 +805,7 @@ class Api:
             raise ApiError(400, "need 'to' or 'gid'")
         if not self.store.is_member(gid, user):
             raise ApiError(403, "not a member")
+        self.send_limiter.check(user)  # cap message/fan-out floods per user
         mid = self.store.spool_message(user, gid, text, files, nonce)
         self.router.wake.set()
         return {"id": mid, "gid": gid}
@@ -696,7 +813,12 @@ class Api:
     def upload(self, user: str, rfile, length: int, rawname: str) -> dict:
         if length <= 0 or length > MAX_FILE:
             raise ApiError(413, f"file must be 1..{MAX_FILE} bytes")
-        staged = self.store.user_dir(user) / "staged"
+        self.upload_limiter.check(user)   # cap upload rate per user
+        udir = self.store.user_dir(user)
+        # per-user storage quota (best-effort accounting; see _storage_used)
+        if self._storage_used(udir) + length > USER_STORAGE_QUOTA:
+            raise ApiError(413, "storage quota exceeded")
+        staged = udir / "staged"
         if sum(1 for p in staged.iterdir() if not p.name.endswith(".meta")) >= MAX_STAGED:
             raise ApiError(429, "too many staged uploads; send or wait")
         name = sanitize_filename(rawname)
@@ -718,7 +840,23 @@ class Api:
         meta = {"name": name, "size": length, "sha256": digest.hexdigest(),
                 "uploaded": now_ms()}
         self.store.write_atomic(staged / (fid + ".meta"), json.dumps(meta).encode())
+        self._add_storage(udir, length)
         return {"file_id": fid, "name": name, "sha256": meta["sha256"]}
+
+    _quota_lock = threading.Lock()
+
+    def _storage_used(self, udir: Path) -> int:
+        try:
+            return int((udir / "storage_used").read_text())
+        except (OSError, ValueError):
+            return 0
+
+    def _add_storage(self, udir: Path, delta: int) -> None:
+        # Conservative running total of a user's uploaded bytes. Monotonic for
+        # now (retention could credit it back later); the quota is a soft cap.
+        with self._quota_lock:
+            self.store.write_atomic(udir / "storage_used",
+                                    str(self._storage_used(udir) + delta).encode())
 
     def attachment(self, user: str, gid: str, mid: str, n: str):
         if not (GID_RE.match(gid) and MID_RE.match(mid) and n.isdigit()
@@ -748,12 +886,25 @@ class Api:
                                  "sha256": meta["sha256"]})
                 except (ValueError, KeyError):
                     continue
+        gid = self.store.gid_of(mdir)
+        sender = (mdir / "from").read_text().strip()
+        at = int(mid[:13])
+        # Intended recipients = members who had joined by the time this message
+        # was sent (excluding the sender). Clients use this — NOT the live
+        # roster — for tick aggregation, so adding a member later never
+        # regresses an old message's read/delivered ticks.
+        recipients = []
+        if gid:
+            for u in self.store.members(gid):
+                if u != sender and self.store.joined_at(gid, u) <= at:
+                    recipients.append(u)
         out = {"id": mid,
-               "gid": self.store.gid_of(mdir),
-               "from": (mdir / "from").read_text().strip(),
-               "at": int(mid[:13]),
+               "gid": gid,
+               "from": sender,
+               "at": at,
                "text": (mdir / "message.txt").read_text(),
                "attachments": atts,
+               "recipients": recipients,
                "deliveredto": self._flags(mdir / "deliveredto"),
                "readby": self._flags(mdir / "readby")}
         if (mdir / "system").is_file():
@@ -1106,6 +1257,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         if path.suffix.lower() == ".html":
             self.send_header("Content-Security-Policy", CSP)
+            self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -1135,9 +1287,9 @@ def cmd_serve(args) -> None:
     static_dir = Path(args.static).resolve() if args.static else None
     if not args.cert:
         log("WARNING: no --cert given, serving PLAIN HTTP — dev use only")
-    httpd, router, _ = build_server(store, args.host, args.port,
-                                    static_dir, args.cert)
-    Janitor(store, retain_days=args.retain_days).start()
+    httpd, router, api = build_server(store, args.host, args.port,
+                                      static_dir, args.cert)
+    Janitor(store, retain_days=args.retain_days, limiters=api.limiters).start()
     scheme = "https" if args.cert else "http"
     log(f"serving on {scheme}://{args.host}:{httpd.server_address[1]} "
         f"(data: {store.root})")

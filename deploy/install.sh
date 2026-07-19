@@ -19,6 +19,10 @@ SVCUSER=internal-chat
 WEB=${1:-}
 CN=${CN:-chat.internal}
 
+# Resolve the web-client path BEFORE cd, or a relative argument would be
+# reinterpreted against the repo root below.
+[ -n "$WEB" ] && WEB=$(cd "$WEB" && pwd)
+
 cd "$(dirname "$0")/.."
 
 id "$SVCUSER" >/dev/null 2>&1 || \
@@ -36,9 +40,11 @@ fi
 
 if [ ! -f "$ETC/server.pem" ]; then
     echo "generating self-signed cert for CN=$CN (replace with your CA's)"
+    # subjectAltName is REQUIRED — modern clients ignore CN and reject a cert
+    # with no SAN even when the CA is explicitly trusted.
     openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
         -keyout "$ETC/server.pem" -out "$ETC/server.pem" \
-        -subj "/CN=$CN" 2>/dev/null
+        -subj "/CN=$CN" -addext "subjectAltName=DNS:$CN" 2>/dev/null
 fi
 chmod 0600 "$ETC/server.pem"
 chown "$SVCUSER:$SVCUSER" "$ETC/server.pem" "$DATA"
@@ -47,7 +53,10 @@ chmod 0700 "$DATA"
 if [ -d /run/systemd/system ]; then  # systemd present AND running
     install -m 0644 deploy/internal-chat.service /etc/systemd/system/
     systemctl daemon-reload
-    systemctl enable --now internal-chat
+    systemctl enable internal-chat
+    # restart (not just enable --now) so re-running the installer to upgrade
+    # actually loads the new code instead of keeping the old process
+    systemctl restart internal-chat
     systemctl --no-pager status internal-chat || true
 else
     echo "systemd not found; start manually:"

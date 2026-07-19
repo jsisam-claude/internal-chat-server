@@ -622,6 +622,105 @@ class ChatServerTest(unittest.TestCase):
         self.assertTrue(set(mids) <= set(ids))
         self.confirm("t24b", entries)
 
+    # ---- regression tests for round-1 bug sweep ------------------------------
+
+    def test_25_mids_strictly_increasing(self):
+        # even ids minted in the same millisecond must be strictly ordered
+        ids = [self.store.next_mid() for _ in range(200)]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(len(set(i[:13] for i in ids)), 200)  # unique timestamps
+
+    def test_26_mid_hwm_persists_across_restart(self):
+        s1 = chatserver.Store(tempfile.mkdtemp(prefix="hwm-"), iters=1000)
+        last = s1.next_mid()
+        # a fresh Store on the same dir must not reissue ids <= the persisted hwm
+        s2 = chatserver.Store(str(s1.root), iters=1000)
+        self.assertGreater(s2.next_mid(), last)
+
+    def test_27_dm_gid_collision_disambiguated(self):
+        for u in ("jean-luc", "mary", "jean", "luc-mary"):
+            if not self.store.user_exists(u):
+                self.store.add_user(u, "pw", must_change=False)
+                self.tokens[u] = self.login(u, "pw")["token"]
+        # {jean-luc, mary} and {jean, luc-mary} both naively map to
+        # d-jean-luc-mary; the second pair must still get its own DM
+        g1 = self.send_msg("jean-luc", "hi", to="mary")["gid"]
+        g2 = self.send_msg("jean", "hi", to="luc-mary")["gid"]
+        self.assertNotEqual(g1, g2)
+        self.assertEqual(sorted(self.store.members(g1)), ["jean-luc", "mary"])
+        self.assertEqual(sorted(self.store.members(g2)), ["jean", "luc-mary"])
+
+    def test_28_left_group_cannot_peek_stale_entry(self):
+        self.fresh("t28a", "t28b")
+        _, g = self.req("POST", "/api/groups", user="t28a",
+                        body={"name": "leak", "members": ["t28b"]})
+        gid = g["gid"]
+        mid = self.send_msg("t28a", "secret", gid=gid)["id"]
+        self.poll_until("t28b", lambda e: e["id"] == mid)  # queued, unconfirmed
+        # forge the exact race: entry still in queue, but membership revoked
+        self.req("POST", f"/api/groups/{gid}/members", user="t28b",
+                 body={"remove": ["t28b"]})
+        self.store.queue_add("t28b", mid, self.store.msg_dir(gid, mid))  # re-add
+        status, _ = self.req("GET", f"/api/message/dequeue/{mid}", user="t28b")
+        self.assertEqual(status, 403)  # content not served to a non-member
+
+    def test_29_send_rate_limited(self):
+        self.fresh("t29a", "t29b")
+        hit = 0
+        for i in range(chatserver.SEND_LIMIT + 5):
+            status, _ = self.req("POST", "/api/messages", user="t29a",
+                                 body={"to": "t29b", "text": f"m{i}",
+                                       "nonce": f"rl-{i:03d}-{'x' * 6}"})
+            if status == 429:
+                hit += 1
+        self.assertGreater(hit, 0)  # burst eventually throttled
+
+    def test_30_ratelimiter_evicts_keys(self):
+        import time as _t
+        rl = chatserver.RateLimiter(limit=1, window=0.05, max_keys=50)
+        for i in range(50):            # fill to the cap
+            rl.check(f"k{i}")
+        _t.sleep(0.06)                 # let every window expire
+        for i in range(50, 60):        # new keys past the cap trigger eviction
+            rl.check(f"k{i}")
+        self.assertLessEqual(len(rl._hits), 50)  # expired keys were reclaimed
+        rl.sweep()                     # janitor path also reclaims
+        self.assertLessEqual(len(rl._hits), 10)
+
+    def test_31_multi_attachment_all_or_nothing(self):
+        self.fresh("t31a", "t31b")
+        good = self.upload("t31a", b"keep me", "keep.bin")
+        # one good fid + one bogus fid: the good upload must NOT be destroyed
+        status, _ = self.req("POST", "/api/messages", user="t31a",
+                             body={"to": "t31b", "text": "x", "nonce": "z" * 12,
+                                   "files": [good["file_id"], "ab" * 16]})
+        self.assertEqual(status, 400)
+        # the good staged file survives, so a corrected resend works
+        sent = self.send_msg("t31a", "retry", to="t31b",
+                             files=[good["file_id"]])
+        self.poll_until("t31b", lambda e: e["id"] == sent["id"])
+        _, m = self.req("GET", f"/api/message/dequeue/{sent['id']}", user="t31b")
+        self.assertEqual(m["attachments"][0]["name"], "keep.bin")
+        self.confirm("t31b", [sent["id"]])
+
+    def test_32_recipients_frozen_at_send_time(self):
+        # a member added AFTER a message must not be an intended recipient of
+        # it, so the message's ticks can't regress when the roster grows
+        self.fresh("t32a", "t32b", "t32c")
+        _, g = self.req("POST", "/api/groups", user="t32a",
+                        body={"name": "grow", "members": ["t32b"]})
+        gid = g["gid"]
+        mid = self.send_msg("t32a", "before carol", gid=gid)["id"]
+        self.poll_until("t32b", lambda e: e["id"] == mid)
+        import time as _t
+        _t.sleep(0.05)
+        self.req("POST", f"/api/groups/{gid}/members", user="t32a",
+                 body={"add": ["t32c"]})
+        _, hist = self.req("GET", f"/api/groups/{gid}/messages", user="t32a")
+        m = next(x for x in hist["messages"] if x["id"] == mid)
+        self.assertEqual(m["recipients"], ["t32b"])  # carol excluded (joined later)
+        self.confirm("t32b", [mid])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
