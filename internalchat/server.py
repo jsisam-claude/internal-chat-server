@@ -6,13 +6,13 @@ from __future__ import annotations
 import json
 import shutil
 import ssl
-import time
+import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
-from .config import CSP, STATIC_TYPES, MAX_JSON, MAX_WAIT
+from .config import CSP, STATIC_TYPES, MAX_JSON, MAX_WAIT, MAX_CONNECTIONS
 from .errors import ApiError
 from .util import log
 from .store import Store
@@ -70,6 +70,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(401, "invalid or expired session")
         return user
 
+    # Global cap on concurrent request threads. Long-polls hold a slot for up
+    # to MAX_WAIT seconds, so this bounds the thread/FD cost of a poll flood
+    # (authenticated or slowloris) instead of spawning one thread per socket
+    # without limit. In front of a reverse proxy this is a backstop.
+    _slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
     def do_GET(self):
         self._dispatch("GET")
 
@@ -77,6 +83,13 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def _dispatch(self, method: str) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.close_connection = True
+            try:
+                self._send_json({"error": "server busy, retry"}, 503)
+            except OSError:
+                pass
+            return
         try:
             url = urlsplit(self.path)
             parts = [p for p in url.path.split("/") if p]
@@ -98,6 +111,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "internal error"}, 500)
             except OSError:
                 pass
+        finally:
+            self._slots.release()
 
     # ---- routing -----------------------------------------------------------
     def _route(self, method: str, p: list[str], q: dict) -> None:

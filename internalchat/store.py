@@ -11,7 +11,6 @@ import secrets
 import shutil
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import (GID_RE, MID_RE, USER_RE, PBKDF2_ITERS, SESSION_IDLE_DAYS)

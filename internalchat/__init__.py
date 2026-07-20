@@ -19,10 +19,11 @@ cli        `serve` / `adduser` / `passwd` command line
 """
 from .config import (  # noqa: F401  (re-exported for tests / embedders)
     SEND_LIMIT, SEND_WINDOW, UPLOAD_LIMIT, UPLOAD_WINDOW, LOGIN_IP_LIMIT,
-    USER_STORAGE_QUOTA, MAX_FILE, MAX_TEXT, MAX_ATTACHMENTS)
+    GROUP_OP_LIMIT, GROUP_OP_WINDOW, USER_STORAGE_QUOTA, MAX_FILE, MAX_TEXT,
+    MAX_ATTACHMENTS)
 from .errors import ApiError  # noqa: F401
 from .util import (  # noqa: F401
-    log, now_ms, mid_date, sanitize_filename, msg_dirs_newest_first)
+    log, now_ms, mid_date, sanitize_filename, msg_dirs_newest_first, image_mime)
 from .store import Store  # noqa: F401
 from .notifier import Notifier  # noqa: F401
 from .ratelimit import RateLimiter  # noqa: F401
@@ -35,6 +36,8 @@ __all__ = [
     "Store", "Notifier", "RateLimiter", "Router", "Janitor", "Api",
     "Handler", "build_server", "main", "ApiError",
     "log", "now_ms", "mid_date", "sanitize_filename", "msg_dirs_newest_first",
-    "SEND_LIMIT", "UPLOAD_LIMIT", "LOGIN_IP_LIMIT", "USER_STORAGE_QUOTA",
+    "image_mime",
+    "SEND_LIMIT", "SEND_WINDOW", "UPLOAD_LIMIT", "UPLOAD_WINDOW",
+    "LOGIN_IP_LIMIT", "GROUP_OP_LIMIT", "GROUP_OP_WINDOW", "USER_STORAGE_QUOTA",
     "MAX_FILE", "MAX_TEXT", "MAX_ATTACHMENTS",
 ]

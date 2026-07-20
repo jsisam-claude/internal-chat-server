@@ -276,7 +276,8 @@ class ChatServerTest(unittest.TestCase):
         for i in range(5):
             sent = self.send_msg("alice", f"pg {i}", to="carol")
             gid, _ = sent["gid"], mids.append(sent["id"])
-        self.poll("carol")  # let routing finish
+        for m in mids:      # wait until ALL are actually routed, not just one
+            self.poll_until("carol", lambda e, m=m: e["id"] == m)
         status, page1 = self.req(
             "GET", f"/api/groups/{gid}/messages?limit=3", user="alice")
         self.assertEqual(len(page1["messages"]), 3)
@@ -829,6 +830,49 @@ class ChatServerTest(unittest.TestCase):
         ):
             up = self.upload("t36a", payload, "f.bin")  # name is irrelevant
             self.assertEqual(up.get("image"), mime)
+
+    # ---- regression tests for the quality+security round ---------------------
+
+    def test_37_duplicate_file_id_rejected(self):
+        self.fresh("t37a", "t37b")
+        up = self.upload("t37a", b"only once", "x.bin")
+        status, _ = self.req("POST", "/api/messages", user="t37a",
+                             body={"to": "t37b", "text": "x", "nonce": "d" * 12,
+                                   "files": [up["file_id"], up["file_id"]]})
+        self.assertEqual(status, 400)  # duplicate fid rejected, not consumed+lost
+        # the staged file survives, so a correct single-ref send works
+        sent = self.send_msg("t37a", "ok", to="t37b", files=[up["file_id"]])
+        self.poll_until("t37b", lambda e: e["id"] == sent["id"])
+        self.confirm("t37b", [sent["id"]])
+
+    def test_38_group_ops_rate_limited(self):
+        self.fresh("t38a", "t38b")
+        hits = 0
+        for i in range(chatserver.GROUP_OP_LIMIT + 4):
+            status, _ = self.req("POST", "/api/groups", user="t38a",
+                                 body={"name": f"g{i}", "members": ["t38b"]})
+            if status == 429:
+                hits += 1
+        self.assertGreater(hits, 0)  # group-creation spam is throttled
+
+    def test_39_change_password_bad_old_is_400(self):
+        self.store.add_user("t39", "pw-t39-init", must_change=False)
+        tok = self.login("t39", "pw-t39-init")["token"]
+        # a non-string 'old' must 400, not 500 (AttributeError on .encode)
+        for bad in (123, None, ["x"], {"a": 1}):
+            status, _ = self.req("POST", "/api/password",
+                                 headers={"Authorization": "Bearer " + tok},
+                                 body={"old": bad, "new": "pw-t39-new-1"})
+            self.assertEqual(status, 400, repr(bad))
+
+    def test_40_storage_quota_enforced(self):
+        self.fresh("t40")
+        udir = self.store.user_dir("t40")
+        # pre-charge the counter to just under quota, then a small upload trips it
+        (udir / "storage_used").write_text(str(chatserver.USER_STORAGE_QUOTA - 4))
+        status, up = self.req("POST", "/api/files", user="t40", body=b"hello",
+                              headers={"X-File-Name": "big.bin"})
+        self.assertEqual(status, 413)  # 5 bytes over the remaining 4 → rejected
 
 
 if __name__ == "__main__":

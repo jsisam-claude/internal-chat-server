@@ -28,7 +28,12 @@ SEND_WINDOW = 60
 UPLOAD_LIMIT = 30        # uploads per UPLOAD_WINDOW per user
 UPLOAD_WINDOW = 60
 LOGIN_IP_LIMIT = 60      # login attempts per 5 min per source IP (any username)
+GROUP_OP_LIMIT = 20      # group create + membership changes per minute per user
+GROUP_OP_WINDOW = 60
 USER_STORAGE_QUOTA = 2 * 1024 * 1024 * 1024   # 2 GB of attachments per user
+MAX_CONNECTIONS = 512    # global cap on concurrent request threads (bounds the
+                         # thread/FD cost of a long-poll flood)
+MAX_POLLS_PER_USER = 8   # concurrent parked long-polls one user may hold
 
 # img-src blob: lets the web client render photos it fetched with its auth
 # header (fetch -> Blob -> object URL); blob: URLs are same-origin-created

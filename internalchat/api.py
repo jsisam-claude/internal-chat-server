@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import secrets
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -16,7 +15,8 @@ from .config import (
     GID_RE, MID_RE, USER_RE, NONCE_RE, FID_RE, ENTRY_RE,
     MAX_TEXT, MAX_FILE, MAX_ATTACHMENTS, MAX_STAGED, MAX_WAIT,
     MAX_GROUP_MEMBERS, SEND_LIMIT, SEND_WINDOW, UPLOAD_LIMIT, UPLOAD_WINDOW,
-    LOGIN_IP_LIMIT, USER_STORAGE_QUOTA)
+    LOGIN_IP_LIMIT, USER_STORAGE_QUOTA, GROUP_OP_LIMIT, GROUP_OP_WINDOW,
+    MAX_POLLS_PER_USER)
 from .errors import ApiError
 from .util import now_ms, sanitize_filename, msg_dirs_newest_first, image_mime
 from .ratelimit import RateLimiter
@@ -35,8 +35,11 @@ class Api:
         self.login_ip_limiter = RateLimiter(limit=LOGIN_IP_LIMIT, window=300)
         self.send_limiter = RateLimiter(limit=SEND_LIMIT, window=SEND_WINDOW)
         self.upload_limiter = RateLimiter(limit=UPLOAD_LIMIT, window=UPLOAD_WINDOW)
+        self.group_limiter = RateLimiter(limit=GROUP_OP_LIMIT,
+                                         window=GROUP_OP_WINDOW)
         self.limiters = [self.login_limiter, self.login_ip_limiter,
-                         self.send_limiter, self.upload_limiter]
+                         self.send_limiter, self.upload_limiter,
+                         self.group_limiter]
 
     # ---- auth --------------------------------------------------------------
     def login(self, ip: str, body: dict) -> dict:
@@ -55,6 +58,8 @@ class Api:
 
     def change_password(self, user: str, body: dict, keep_token: str) -> dict:
         old, new = body.get("old", ""), body.get("new", "")
+        if not isinstance(old, str):        # a non-string old must 400, not 500
+            raise ApiError(400, "bad old password")
         if not isinstance(new, str) or len(new) < 8 or len(new) > 128:
             raise ApiError(400, "new password must be 8..128 chars")
         if self.store.verify_password(user, old) is None:
@@ -67,14 +72,31 @@ class Api:
                 s.unlink(missing_ok=True)
         return {"ok": True}
 
+    _poll_lock = threading.Lock()
+    _polls: dict = {}   # user -> number of currently-parked long-polls
+
     # ---- queue -------------------------------------------------------------
     def list_queue(self, user: str, wait: float) -> dict:
         deadline = time.time() + max(0.0, min(wait, MAX_WAIT))
-        while True:
-            items = self._queue_items(user)
-            if items or time.time() >= deadline:
-                return {"queue": items}
-            self.notifier.wait(user, min(1.0, deadline - time.time()))
+        # First check is always cheap. Only PARKING (waiting) is capped per
+        # user, so one account can't tie up unbounded worker threads by opening
+        # many concurrent long-polls.
+        items = self._queue_items(user)
+        if items or time.time() >= deadline:
+            return {"queue": items}
+        with self._poll_lock:
+            if self._polls.get(user, 0) >= MAX_POLLS_PER_USER:
+                return {"queue": items}          # too many parked: return now
+            self._polls[user] = self._polls.get(user, 0) + 1
+        try:
+            while True:
+                items = self._queue_items(user)
+                if items or time.time() >= deadline:
+                    return {"queue": items}
+                self.notifier.wait(user, min(1.0, deadline - time.time()))
+        finally:
+            with self._poll_lock:
+                self._polls[user] = max(0, self._polls.get(user, 1) - 1)
 
     def _queue_items(self, user: str) -> list[dict]:
         out = []
@@ -197,6 +219,8 @@ class Api:
         if not (isinstance(files, list) and len(files) <= MAX_ATTACHMENTS
                 and all(isinstance(f, str) and FID_RE.match(f) for f in files)):
             raise ApiError(400, "bad files list")
+        if len(set(files)) != len(files):   # a repeated fid would be consumed
+            raise ApiError(400, "duplicate file id")  # once, then destroyed
         if not text.strip() and not files:
             raise ApiError(400, "empty message")
         to = body.get("to")
@@ -221,38 +245,43 @@ class Api:
             raise ApiError(413, f"file must be 1..{MAX_FILE} bytes")
         self.upload_limiter.check(user)   # cap upload rate per user
         udir = self.store.user_dir(user)
-        # per-user storage quota (best-effort accounting; see _storage_used)
-        if self._storage_used(udir) + length > USER_STORAGE_QUOTA:
-            raise ApiError(413, "storage quota exceeded")
         staged = udir / "staged"
         if sum(1 for p in staged.iterdir() if not p.name.endswith(".meta")) >= MAX_STAGED:
             raise ApiError(429, "too many staged uploads; send or wait")
-        name = sanitize_filename(rawname)
-        fid = secrets.token_hex(16)
-        tmp = self.store.root / "tmp" / f"u-{fid}"
-        digest = hashlib.sha256()
-        remaining = length
-        head = b""      # first bytes, for content-based (never name-based)
-        with open(tmp, "wb") as f:              # image detection
-            os.fchmod(f.fileno(), 0o600)
-            while remaining:
-                chunk = rfile.read(min(65536, remaining))
-                if not chunk:
-                    tmp.unlink(missing_ok=True)
-                    raise ApiError(400, "truncated upload")
-                if len(head) < 16:
-                    head += chunk[:16 - len(head)]
-                digest.update(chunk)
-                f.write(chunk)
-                remaining -= len(chunk)
-        os.replace(tmp, staged / fid)
-        meta = {"name": name, "size": length, "sha256": digest.hexdigest(),
-                "uploaded": now_ms()}
-        mime = image_mime(head)
-        if mime:
-            meta["image"] = mime  # server-verified: the ONLY basis for inline
-        self.store.write_atomic(staged / (fid + ".meta"), json.dumps(meta).encode())
-        self._add_storage(udir, length)
+        # RESERVE the bytes under the lock before streaming, so concurrent
+        # uploads can't collectively overshoot the quota; credited back if the
+        # upload fails.
+        self._reserve_storage(udir, length)
+        try:
+            name = sanitize_filename(rawname)
+            fid = secrets.token_hex(16)
+            tmp = self.store.root / "tmp" / f"u-{fid}"
+            digest = hashlib.sha256()
+            remaining = length
+            head = b""      # first bytes, for content-based (never name-based)
+            with open(tmp, "wb") as f:              # image detection
+                os.fchmod(f.fileno(), 0o600)
+                while remaining:
+                    chunk = rfile.read(min(65536, remaining))
+                    if not chunk:
+                        tmp.unlink(missing_ok=True)
+                        raise ApiError(400, "truncated upload")
+                    if len(head) < 16:
+                        head += chunk[:16 - len(head)]
+                    digest.update(chunk)
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            os.replace(tmp, staged / fid)
+            meta = {"name": name, "size": length, "sha256": digest.hexdigest(),
+                    "uploaded": now_ms()}
+            mime = image_mime(head)
+            if mime:
+                meta["image"] = mime  # server-verified: the ONLY basis for inline
+            self.store.write_atomic(staged / (fid + ".meta"),
+                                    json.dumps(meta).encode())
+        except Exception:
+            self._add_storage(udir, -length)   # release the reservation
+            raise
         out = {"file_id": fid, "name": name, "sha256": meta["sha256"]}
         if mime:
             out["image"] = mime
@@ -266,12 +295,19 @@ class Api:
         except (OSError, ValueError):
             return 0
 
-    def _add_storage(self, udir: Path, delta: int) -> None:
-        # Conservative running total of a user's uploaded bytes. Monotonic for
-        # now (retention could credit it back later); the quota is a soft cap.
+    def _reserve_storage(self, udir: Path, length: int) -> None:
+        # Atomic check-and-reserve so parallel uploads can't overshoot the cap.
         with self._quota_lock:
+            used = self._storage_used(udir)
+            if used + length > USER_STORAGE_QUOTA:
+                raise ApiError(413, "storage quota exceeded")
             self.store.write_atomic(udir / "storage_used",
-                                    str(self._storage_used(udir) + delta).encode())
+                                    str(used + length).encode())
+
+    def _add_storage(self, udir: Path, delta: int) -> None:
+        with self._quota_lock:
+            new = max(0, self._storage_used(udir) + delta)
+            self.store.write_atomic(udir / "storage_used", str(new).encode())
 
     def attachment(self, user: str, gid: str, mid: str, n: str):
         if not (GID_RE.match(gid) and MID_RE.match(mid) and n.isdigit()
@@ -399,6 +435,7 @@ class Api:
         return None
 
     def create_group(self, user: str, body: dict) -> dict:
+        self.group_limiter.check(user)   # group creation fans out system msgs
         name = body.get("name", "")
         members = body.get("members", [])
         if not (isinstance(name, str) and 1 <= len(name) <= 64 and name.isprintable()):
@@ -425,6 +462,7 @@ class Api:
             raise ApiError(400, "bad group id")
         if not self.store.is_member(gid, user):
             raise ApiError(403, "not a member")
+        self.group_limiter.check(user)   # membership changes fan out system msgs
         add = body.get("add", [])
         remove = body.get("remove", [])
         if not (isinstance(add, list) and isinstance(remove, list)):
