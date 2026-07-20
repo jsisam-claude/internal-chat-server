@@ -25,6 +25,7 @@ class Store:
         self.root = Path(root).resolve()
         self.iters = iters
         self._id_lock = threading.Lock()
+        self._quota_lock = threading.Lock()
         for name in ("tmp", "incoming", "users", "groups", "archive", "rejected"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         # High-water mark for the message-id clock, persisted so a restart
@@ -76,6 +77,32 @@ class Store:
         tmp = self.root / "tmp" / f"w-{secrets.token_hex(8)}"
         tmp.write_bytes(data)
         os.replace(tmp, path)
+
+    # ---- per-user storage accounting -------------------------------------
+    # A running byte total per user. It must be TWO-WAY (credited back when
+    # bytes are deleted) or the quota becomes a permanent lifetime cap that
+    # eventually locks everyone out. Lives here so the janitor and router can
+    # credit back on prune/bounce, not just the upload path.
+    def storage_used(self, user: str) -> int:
+        try:
+            return int((self.user_dir(user) / "storage_used").read_text())
+        except (OSError, ValueError):
+            return 0
+
+    def add_storage(self, user: str, delta: int) -> None:
+        with self._quota_lock:
+            new = max(0, self.storage_used(user) + delta)
+            self.write_atomic(self.user_dir(user) / "storage_used",
+                              str(new).encode())
+
+    def reserve_storage(self, user: str, length: int, quota: int) -> None:
+        """Atomic check-and-reserve so parallel uploads can't overshoot."""
+        with self._quota_lock:
+            used = self.storage_used(user)
+            if used + length > quota:
+                raise ApiError(413, "storage quota exceeded")
+            self.write_atomic(self.user_dir(user) / "storage_used",
+                              str(used + length).encode())
 
     # ---- users / auth ----------------------------------------------------
     def add_user(self, user: str, password: str, display: str | None = None,
@@ -279,9 +306,10 @@ class Store:
         with its mid (dedup), or for it to release the claim on failure (in
         which case the caller should retry)."""
         for _ in range(100):
-            if not nf.exists():
+            try:
+                mid = nf.read_text()
+            except FileNotFoundError:
                 raise ApiError(503, "send failed, please retry")  # claimer aborted
-            mid = nf.read_text()
             if mid:
                 return mid
             time.sleep(0.01)

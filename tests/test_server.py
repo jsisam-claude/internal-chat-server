@@ -874,6 +874,61 @@ class ChatServerTest(unittest.TestCase):
                               headers={"X-File-Name": "big.bin"})
         self.assertEqual(status, 413)  # 5 bytes over the remaining 4 → rejected
 
+    # ---- regression tests for the second quality+security round --------------
+
+    def test_41_janitor_credits_back_expired_staged(self):
+        self.fresh("t41")
+        self.upload("t41", b"x" * 1000, "a.bin")
+        used = self.store.storage_used("t41")
+        self.assertGreaterEqual(used, 1000)
+        # age the staged files past 24h and run the janitor
+        import time as _t
+        staged = self.store.user_dir("t41") / "staged"
+        old = _t.time() - 86400 - 10
+        for p in staged.iterdir():
+            os.utime(p, (old, old))
+        chatserver.Janitor(self.store).clean()
+        self.assertEqual(list(staged.iterdir()), [])       # pruned
+        self.assertEqual(self.store.storage_used("t41"), used - 1000)  # credited
+
+    def test_42_modify_members_atomic(self):
+        self.fresh("t42a", "t42b", "t42c")
+        _, g = self.req("POST", "/api/groups", user="t42a",
+                        body={"name": "atomic", "members": ["t42b"]})
+        gid = g["gid"]
+        # add t42c together with an illegal remove of someone-else → must 403
+        # WITHOUT having added t42c (validate-before-apply)
+        status, _ = self.req("POST", f"/api/groups/{gid}/members", user="t42a",
+                             body={"add": ["t42c"], "remove": ["t42b"]})
+        self.assertEqual(status, 403)
+        self.assertNotIn("t42c", self.store.members(gid))  # add not committed
+
+    def test_43_pre_join_attachment_and_state_hidden(self):
+        self.fresh("t43a", "t43b", "t43c")
+        _, g = self.req("POST", "/api/groups", user="t43a",
+                        body={"name": "prejoin", "members": ["t43b"]})
+        gid = g["gid"]
+        up = self.upload("t43a", b"secret pixels", "s.bin")
+        sent = self.send_msg("t43a", "before c", gid=gid, files=[up["file_id"]])
+        mid = sent["id"]
+        self.poll_until("t43b", lambda e: e["id"] == mid)
+        import time as _t
+        _t.sleep(0.05)
+        self.req("POST", f"/api/groups/{gid}/members", user="t43a",
+                 body={"add": ["t43c"]})
+        # t43c joined after the message: attachment + state must be hidden
+        status, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1", user="t43c")
+        self.assertEqual(status, 404)
+        status, _ = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t43c")
+        self.assertEqual(status, 404)
+        self.confirm("t43b", [mid])
+
+    def test_44_per_instance_poll_state(self):
+        # the parked-poll counter must be per-Api-instance, not global
+        a2 = chatserver.Api(self.store, chatserver.Notifier(),
+                            chatserver.Router(self.store, chatserver.Notifier()))
+        self.assertIsNot(self.api._polls, a2._polls)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

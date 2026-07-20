@@ -7,6 +7,7 @@ Janitor — periodic retention: archive old days, prune stale temp/session/
           nonce files and dangling queue links, sweep rate-limiter memory."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import threading
@@ -97,24 +98,27 @@ class Router(threading.Thread):
         """Finish messages that were renamed into a group but crashed before
         their queue symlinks / .routed marker were created.
 
-        The single router thread drains incoming/ in id order and routes one
-        message at a time (rename, then _finish), so at most one message per
-        group can be mid-route at a crash, and it is among the NEWEST in that
-        group. We therefore walk each group newest-first and stop at the first
-        already-.routed message — O(groups) work, correct regardless of how
-        long the outage lasted (no wall-clock cutoff, which was measured from
-        the wrong instant)."""
+        The single router thread routes one message at a time, so an unfinished
+        message sits in a recent day folder (no new messages arrive during an
+        outage, so its day is among the group's most recent regardless of how
+        long the outage lasted). We scan the two newest day folders per group
+        and finish EVERY message lacking `.routed` — not stopping at the first
+        finished one, since a failed prior recovery could leave an older gap
+        below a newer finished message."""
         for gdir in (self.store.root / "groups").iterdir():
-            for mdir in msg_dirs_newest_first(gdir):
-                if (mdir / ".routed").exists():
-                    break  # everything older in this group is finished
-                try:
-                    sender = (mdir / "from").read_text().strip()
-                    self._finish(mdir, mdir.name, sender,
-                                 self.store.members(gdir.name))
-                    log(f"router: recovered {mdir.name}")
-                except Exception as e:
-                    log(f"router: recovery failed for {mdir}: {e}")
+            days = sorted((d for d in gdir.iterdir() if DATE_RE.match(d.name)),
+                          key=lambda p: p.name, reverse=True)[:2]
+            for day in days:
+                for mdir in sorted(day.iterdir()):
+                    if not MID_RE.match(mdir.name) or (mdir / ".routed").exists():
+                        continue
+                    try:
+                        sender = (mdir / "from").read_text().strip()
+                        self._finish(mdir, mdir.name, sender,
+                                     self.store.members(gdir.name))
+                        log(f"router: recovered {mdir.name}")
+                    except Exception as e:
+                        log(f"router: recovery failed for {mdir}: {e}")
 
 
 class Janitor(threading.Thread):
@@ -154,8 +158,10 @@ class Janitor(threading.Thread):
 
         prune(self.store.root / "tmp", 3600, dirs=True)
         for udir in (self.store.root / "users").iterdir():
-            prune(udir / "staged", 86400)
-            prune(udir / "nonces", 7 * 86400)
+            self._prune_staged(udir, now)   # credits storage back on expiry
+            # empty nonce files are aborted send-claims; reclaim them fast
+            # (1h) so a crashed claim doesn't wedge that nonce for 7 days
+            self._prune_nonces(udir, now)
             prune(udir / "sessions", SESSION_IDLE_DAYS * 86400)
             # queue symlinks whose message was archived/deleted are dead;
             # without this an always-offline user's queue would grow forever
@@ -175,4 +181,47 @@ class Janitor(threading.Thread):
                         dst = self.store.root / "archive" / gdir.name
                         dst.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(day), dst / day.name)
+
+    def _prune_staged(self, udir: Path, now: float) -> None:
+        """Delete staged uploads older than 24h AND credit their bytes back to
+        the user's quota — otherwise never-sent uploads consume it forever."""
+        staged = udir / "staged"
+        try:
+            entries = list(staged.iterdir())
+        except FileNotFoundError:
+            return
+        user = udir.name
+        for p in entries:
+            if p.name.endswith(".meta"):
+                continue
+            try:
+                if now - p.lstat().st_mtime <= 86400:
+                    continue
+                size = 0
+                metaf = staged / (p.name + ".meta")
+                try:
+                    size = json.loads(metaf.read_text()).get("size", 0)
+                except (OSError, ValueError):
+                    pass
+                p.unlink(missing_ok=True)
+                metaf.unlink(missing_ok=True)
+                if size:
+                    self.store.add_storage(user, -size)
+            except OSError:
+                pass
+
+    def _prune_nonces(self, udir: Path, now: float) -> None:
+        try:
+            entries = list((udir / "nonces").iterdir())
+        except FileNotFoundError:
+            return
+        for p in entries:
+            try:
+                age = now - p.lstat().st_mtime
+                # empty = aborted claim (reclaim after 1h); filled = keep 7 days
+                ttl = 3600 if p.stat().st_size == 0 else 7 * 86400
+                if age > ttl:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
 

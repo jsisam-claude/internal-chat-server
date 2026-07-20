@@ -2,7 +2,14 @@
 
 Everything is JSON over HTTPS except file bytes. All endpoints except
 `POST /api/login` require `Authorization: Bearer <token>`. Errors are
-`{"error": "<message>"}` with 400/401/403/404/413/429 status codes.
+`{"error": "<message>"}`. Status codes: 400 (bad input, incl. duplicate
+file id), 401 (no/expired session), 403 (not a member / wrong password),
+404 (not found / pre-join), 413 (file too big or per-user storage quota
+exceeded, 2 GB), 429 (rate-limited: login, send, upload, group ops), 503
+(server at its connection cap, or a transient send-claim collision — retry),
+500 (server bug). `confirm` and `viewed` process at most 500 ids per call,
+so clients must chunk larger batches (the server silently ignores the
+overflow otherwise).
 
 The one rule that shapes everything: **a client learns things only through
 its queue** (`GET /api/messages`). New messages, delivered ticks, read ticks,
@@ -50,10 +57,18 @@ after a crash. 404 if the id isn't in *your* queue.
 ```json
 {"id":"1784…9f2a", "gid":"d-alice-bob", "from":"alice", "at":1784070365969,
  "text":"see attached",
- "attachments":[{"n":1,"name":"report.pdf","size":48211,"sha256":"…"}],
+ "attachments":[{"n":1,"name":"report.pdf","size":48211,"sha256":"…",
+                 "image":"image/png"}],   // "image" only on verified images
+ "recipients":["bob"],                    // members at SEND time (see below)
  "deliveredto":{}, "readby":{},
  "system":{"event":"join","user":"carol","by":"alice"}}   // only on announcements
 ```
+
+**`recipients`** is the set of members who had joined by the time this message
+was sent (excluding the sender). Aggregate ticks over THIS set, not the live
+roster — a member added later is not a recipient of older messages, so
+`recipients` keeps their ✓✓/read state from regressing. `history` returns it
+too. **`image`** on an attachment is the server-verified mime (see §3).
 
 ### `POST /api/message/dequeue/read/<entry>[,<entry>…]` — confirm
 

@@ -36,11 +36,19 @@ class Handler(BaseHTTPRequestHandler):
             log(f"{self.client_address[0]} {self.command} "
                 f"{self.path.split('?')[0]} -> {code}")
 
+    def _hsts(self) -> None:
+        # HSTS only over TLS (browsers must ignore it on plain HTTP, and the
+        # spec forbids sending it there).
+        if isinstance(self.connection, ssl.SSLSocket):
+            self.send_header("Strict-Transport-Security",
+                             "max-age=31536000; includeSubDomains")
+
     def _send_json(self, obj, status: int = 200) -> None:
         data = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._hsts()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -70,12 +78,6 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(401, "invalid or expired session")
         return user
 
-    # Global cap on concurrent request threads. Long-polls hold a slot for up
-    # to MAX_WAIT seconds, so this bounds the thread/FD cost of a poll flood
-    # (authenticated or slowloris) instead of spawning one thread per socket
-    # without limit. In front of a reverse proxy this is a backstop.
-    _slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
-
     def do_GET(self):
         self._dispatch("GET")
 
@@ -83,13 +85,6 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def _dispatch(self, method: str) -> None:
-        if not self._slots.acquire(blocking=False):
-            self.close_connection = True
-            try:
-                self._send_json({"error": "server busy, retry"}, 503)
-            except OSError:
-                pass
-            return
         try:
             url = urlsplit(self.path)
             parts = [p for p in url.path.split("/") if p]
@@ -111,8 +106,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "internal error"}, 500)
             except OSError:
                 pass
-        finally:
-            self._slots.release()
 
     # ---- routing -----------------------------------------------------------
     def _route(self, method: str, p: list[str], q: dict) -> None:
@@ -245,6 +238,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", "attachment")
         self.send_header("Content-Type", ctype)
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._hsts()
         if path.suffix.lower() == ".html":
             self.send_header("Content-Security-Policy", CSP)
             self.send_header("X-Frame-Options", "DENY")
@@ -254,6 +248,32 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Caps CONCURRENT CONNECTIONS at the accept side, before a worker thread is
+    spawned — so a flood (including slowloris clients that dribble headers and
+    would otherwise each hold a thread + FD) can't exhaust threads/FDs. Excess
+    connections are closed immediately; the semaphore is released when the
+    connection's thread finishes. This is the real thread/FD bound; put a
+    reverse proxy in front for production-grade connection limiting."""
+    max_connections = MAX_CONNECTIONS
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._conn_slots = threading.BoundedSemaphore(self.max_connections)
+
+    def process_request(self, request, client_address):
+        if not self._conn_slots.acquire(blocking=False):
+            self.shutdown_request(request)   # at capacity: drop the connection
+            return
+        super().process_request(request, client_address)  # spawns the thread
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_slots.release()
+
+
 def build_server(store: Store, host: str, port: int,
                  static_dir: Path | None = None, certfile: str | None = None):
     notifier = Notifier()
@@ -261,7 +281,7 @@ def build_server(store: Store, host: str, port: int,
     api = Api(store, notifier, router)
     handler = type("BoundHandler", (Handler,),
                    {"api": api, "static_dir": static_dir})
-    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd = BoundedHTTPServer((host, port), handler)
     httpd.daemon_threads = True
     if certfile:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

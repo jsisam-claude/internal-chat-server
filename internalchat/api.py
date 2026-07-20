@@ -40,6 +40,10 @@ class Api:
         self.limiters = [self.login_limiter, self.login_ip_limiter,
                          self.send_limiter, self.upload_limiter,
                          self.group_limiter]
+        # per-INSTANCE (not class) so two servers in one process don't share
+        # a global parked-poll counter
+        self._poll_lock = threading.Lock()
+        self._polls: dict = {}   # user -> number of currently-parked long-polls
 
     # ---- auth --------------------------------------------------------------
     def login(self, ip: str, body: dict) -> dict:
@@ -72,9 +76,6 @@ class Api:
                 s.unlink(missing_ok=True)
         return {"ok": True}
 
-    _poll_lock = threading.Lock()
-    _polls: dict = {}   # user -> number of currently-parked long-polls
-
     # ---- queue -------------------------------------------------------------
     def list_queue(self, user: str, wait: float) -> dict:
         deadline = time.time() + max(0.0, min(wait, MAX_WAIT))
@@ -86,7 +87,8 @@ class Api:
             return {"queue": items}
         with self._poll_lock:
             if self._polls.get(user, 0) >= MAX_POLLS_PER_USER:
-                return {"queue": items}          # too many parked: return now
+                time.sleep(0.5)          # too many parked: brief pause so a
+                return {"queue": items}  # naive client can't hot-spin
             self._polls[user] = self._polls.get(user, 0) + 1
         try:
             while True:
@@ -96,7 +98,11 @@ class Api:
                 self.notifier.wait(user, min(1.0, deadline - time.time()))
         finally:
             with self._poll_lock:
-                self._polls[user] = max(0, self._polls.get(user, 1) - 1)
+                n = self._polls.get(user, 1) - 1
+                if n > 0:
+                    self._polls[user] = n
+                else:
+                    self._polls.pop(user, None)   # don't grow the dict forever
 
     def _queue_items(self, user: str) -> list[dict]:
         out = []
@@ -250,8 +256,8 @@ class Api:
             raise ApiError(429, "too many staged uploads; send or wait")
         # RESERVE the bytes under the lock before streaming, so concurrent
         # uploads can't collectively overshoot the quota; credited back if the
-        # upload fails.
-        self._reserve_storage(udir, length)
+        # upload fails (and by the janitor when staged files expire).
+        self.store.reserve_storage(user, length, USER_STORAGE_QUOTA)
         try:
             name = sanitize_filename(rawname)
             fid = secrets.token_hex(16)
@@ -280,29 +286,12 @@ class Api:
             self.store.write_atomic(staged / (fid + ".meta"),
                                     json.dumps(meta).encode())
         except Exception:
-            self._add_storage(udir, -length)   # release the reservation
+            self.store.add_storage(user, -length)   # release the reservation
             raise
         out = {"file_id": fid, "name": name, "sha256": meta["sha256"]}
         if mime:
             out["image"] = mime
         return out
-
-    _quota_lock = threading.Lock()
-
-    def _storage_used(self, udir: Path) -> int:
-        try:
-            return int((udir / "storage_used").read_text())
-        except (OSError, ValueError):
-            return 0
-
-    def _reserve_storage(self, udir: Path, length: int) -> None:
-        # Atomic check-and-reserve so parallel uploads can't overshoot the cap.
-        with self._quota_lock:
-            used = self._storage_used(udir)
-            if used + length > USER_STORAGE_QUOTA:
-                raise ApiError(413, "storage quota exceeded")
-            self.store.write_atomic(udir / "storage_used",
-                                    str(used + length).encode())
 
     def _add_storage(self, udir: Path, delta: int) -> None:
         with self._quota_lock:
@@ -315,6 +304,8 @@ class Api:
             raise ApiError(400, "bad attachment path")
         if not self.store.is_member(gid, user):
             raise ApiError(403, "not a member")
+        if int(mid[:13]) < self.store.joined_at(gid, user):
+            raise ApiError(404, "no such attachment")  # pre-join: invisible
         mdir = self.store.msg_dir(gid, mid)
         blob = mdir / "attachments" / str(int(n))
         metaf = mdir / "attachments" / f"{int(n)}.meta"
@@ -380,6 +371,8 @@ class Api:
             raise ApiError(400, "bad ids")
         if not self.store.is_member(gid, user):
             raise ApiError(403, "not a member")
+        if int(mid[:13]) < self.store.joined_at(gid, user):
+            raise ApiError(404, "no such message")  # pre-join: invisible
         mdir = self.store.msg_dir(gid, mid)
         if not mdir.is_dir():
             raise ApiError(404, "no such message")
@@ -467,10 +460,16 @@ class Api:
         remove = body.get("remove", [])
         if not (isinstance(add, list) and isinstance(remove, list)):
             raise ApiError(400, "bad body")
-        md = self.store.group_dir(gid) / "members"
+        # validate EVERYTHING before mutating anything, so a bad `remove` can't
+        # leave the `add`s (and their join announcements) half-committed
         for u in add:
             if not (isinstance(u, str) and self.store.user_exists(u)):
                 raise ApiError(404, f"no such user: {u}")
+        for u in remove:
+            if u != user:
+                raise ApiError(403, "members can only remove themselves")
+        md = self.store.group_dir(gid) / "members"
+        for u in add:
             if len(self.store.members(gid)) >= MAX_GROUP_MEMBERS:
                 raise ApiError(400, "group full")
             if (md / u).exists():
@@ -480,8 +479,6 @@ class Api:
                 user, gid, f"{user} added {u}",
                 {"event": "join", "user": u, "by": user})
         for u in remove:
-            if u != user:
-                raise ApiError(403, "members can only remove themselves")
             if not (md / u).exists():
                 continue
             self.store.spool_system(u, gid, f"{u} left",

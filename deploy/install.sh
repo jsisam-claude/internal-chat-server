@@ -70,5 +70,8 @@ fi
 
 echo
 echo "next steps:"
-echo "  python3 $APP/chatserver.py adduser <name> --data $DATA   # provision users"
+# provision AS THE SERVICE USER so the created users/<name>/{sessions,queue,...}
+# dirs are owned by the service — running adduser as root makes them root-owned
+# and the service (running as $SVCUSER) then 500s on login trying to write them.
+echo "  sudo -u $SVCUSER python3 $APP/chatserver.py adduser <name> --data $DATA"
 echo "  mount $DATA with noexec,nosuid,nodev                     # recommended"
