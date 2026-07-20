@@ -91,14 +91,26 @@ Ticks then arrive via the queue: `~d~` from each recipient (✓✓ when all),
 Raw request body (no multipart). Headers: `Content-Length` (≤ 50 MB),
 `X-File-Name: report.pdf` (metadata only — never becomes a path).
 
-→ `{"file_id":"3f9c…","name":"report.pdf","sha256":"…"}` — then reference in
-`files` on send. Staged uploads expire after 24 h; at most 16 pending.
+→ `{"file_id":"3f9c…","name":"report.pdf","sha256":"…","image":"image/png"}`
+— then reference in `files` on send. Staged uploads expire after 24 h; at most
+16 pending. **`image`** is present only when the server verified the bytes are
+a safe-to-render image (png/jpeg/gif/webp) by their **magic bytes** — never by
+the filename. It is the *only* thing that unlocks inline rendering, and it is
+echoed on each attachment in `render_msg` output.
 
-### `GET /api/attachments/<gid>/<mid>/<n>` — download
+### `GET /api/attachments/<gid>/<mid>/<n>[?inline=1]` — download / view
 
-Membership-checked. Always `application/octet-stream` +
-`Content-Disposition: attachment` + `nosniff` — attachments are downloads,
-never renderable content.
+Membership-checked. By default `application/octet-stream` +
+`Content-Disposition: attachment` + `nosniff` — a forced download.
+
+`?inline=1` returns the image inline (its verified `image/*` type,
+`Content-Disposition: inline`) **only if** the server flagged the attachment
+as a verified image at upload; otherwise the flag is ignored and the response
+stays a forced octet-stream download. Inline responses additionally carry
+`Content-Security-Policy: default-src 'none'; sandbox` and
+`Cross-Origin-Resource-Policy: same-origin`, so the bytes can never act as a
+document or run script even if a client dereferenced them directly. SVG is
+never inline-eligible (scriptable XML).
 
 ## 4. Conversations & directory
 

@@ -18,7 +18,7 @@ from .config import (
     MAX_GROUP_MEMBERS, SEND_LIMIT, SEND_WINDOW, UPLOAD_LIMIT, UPLOAD_WINDOW,
     LOGIN_IP_LIMIT, USER_STORAGE_QUOTA)
 from .errors import ApiError
-from .util import now_ms, sanitize_filename, msg_dirs_newest_first
+from .util import now_ms, sanitize_filename, msg_dirs_newest_first, image_mime
 from .ratelimit import RateLimiter
 from .store import Store
 from .notifier import Notifier
@@ -232,22 +232,31 @@ class Api:
         tmp = self.store.root / "tmp" / f"u-{fid}"
         digest = hashlib.sha256()
         remaining = length
-        with open(tmp, "wb") as f:
+        head = b""      # first bytes, for content-based (never name-based)
+        with open(tmp, "wb") as f:              # image detection
             os.fchmod(f.fileno(), 0o600)
             while remaining:
                 chunk = rfile.read(min(65536, remaining))
                 if not chunk:
                     tmp.unlink(missing_ok=True)
                     raise ApiError(400, "truncated upload")
+                if len(head) < 16:
+                    head += chunk[:16 - len(head)]
                 digest.update(chunk)
                 f.write(chunk)
                 remaining -= len(chunk)
         os.replace(tmp, staged / fid)
         meta = {"name": name, "size": length, "sha256": digest.hexdigest(),
                 "uploaded": now_ms()}
+        mime = image_mime(head)
+        if mime:
+            meta["image"] = mime  # server-verified: the ONLY basis for inline
         self.store.write_atomic(staged / (fid + ".meta"), json.dumps(meta).encode())
         self._add_storage(udir, length)
-        return {"file_id": fid, "name": name, "sha256": meta["sha256"]}
+        out = {"file_id": fid, "name": name, "sha256": meta["sha256"]}
+        if mime:
+            out["image"] = mime
+        return out
 
     _quota_lock = threading.Lock()
 
@@ -287,9 +296,12 @@ class Api:
             for metaf in sorted(adir.glob("*.meta")):
                 try:
                     meta = json.loads(metaf.read_text())
-                    atts.append({"n": int(metaf.name.split(".")[0]),
-                                 "name": meta["name"], "size": meta["size"],
-                                 "sha256": meta["sha256"]})
+                    a = {"n": int(metaf.name.split(".")[0]),
+                         "name": meta["name"], "size": meta["size"],
+                         "sha256": meta["sha256"]}
+                    if meta.get("image"):   # server-verified at upload
+                        a["image"] = meta["image"]
+                    atts.append(a)
                 except (ValueError, KeyError):
                     continue
         gid = self.store.gid_of(mdir)

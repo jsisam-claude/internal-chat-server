@@ -30,8 +30,11 @@ UPLOAD_WINDOW = 60
 LOGIN_IP_LIMIT = 60      # login attempts per 5 min per source IP (any username)
 USER_STORAGE_QUOTA = 2 * 1024 * 1024 * 1024   # 2 GB of attachments per user
 
+# img-src blob: lets the web client render photos it fetched with its auth
+# header (fetch -> Blob -> object URL); blob: URLs are same-origin-created
+# media only, so this widens nothing an attacker controls.
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
-       "connect-src 'self'; img-src 'self'; base-uri 'none'; "
+       "connect-src 'self'; img-src 'self' blob:; base-uri 'none'; "
        "form-action 'none'; frame-ancestors 'none'")
 
 STATIC_TYPES = {

@@ -39,6 +39,24 @@ def sanitize_filename(raw: str) -> str:
     return name[:120] or "file"
 
 
+def image_mime(head: bytes) -> str | None:
+    """Detect a SAFE-to-render-inline image type from magic bytes only —
+    never from the filename, which the uploader controls. Deliberate
+    allowlist: png/jpeg/gif/webp. SVG is intentionally absent (it is
+    scriptable XML and must never be served inline), as are formats with
+    exotic parser surface (BMP/TIFF/ICO). Comparing a few constant bytes is
+    NOT image parsing — the server still never decodes uploads."""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def msg_dirs_newest_first(gdir: Path):
     """All message dirs of a group, newest first — the one directory-walk
     used by history, previews, and recovery."""

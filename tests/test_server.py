@@ -759,6 +759,77 @@ class ChatServerTest(unittest.TestCase):
                                        "nonce": nonce})
         self.assertEqual(again["id"], resp["id"])
 
+    # a real 1x1 transparent PNG (magic + decodable by browsers)
+    PNG_1PX = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d4944415478da63fcffff3f030005fe02fea7566d33"
+        "0000000049454e44ae426082")
+
+    def test_34_image_detected_and_served_inline(self):
+        self.fresh("t34a", "t34b")
+        up = self.upload("t34a", self.PNG_1PX, "photo.png")
+        self.assertEqual(up.get("image"), "image/png")  # detected at upload
+        sent = self.send_msg("t34a", "", to="t34b", files=[up["file_id"]])
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t34b", lambda e: e["id"] == mid)
+        _, m = self.req("GET", f"/api/message/dequeue/{mid}", user="t34b")
+        self.assertEqual(m["attachments"][0]["image"], "image/png")
+
+        # inline request on a VERIFIED image: image content-type + inline
+        # disposition + sandbox CSP + nosniff
+        r, data = self.req("GET",
+                           f"/api/attachments/{gid}/{mid}/1?inline=1",
+                           user="t34b", raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(data, self.PNG_1PX)
+        self.assertEqual(r.getheader("Content-Type"), "image/png")
+        self.assertTrue(r.getheader("Content-Disposition").startswith("inline"))
+        self.assertEqual(r.getheader("X-Content-Type-Options"), "nosniff")
+        self.assertIn("sandbox", r.getheader("Content-Security-Policy"))
+        # without inline=1 the default stays a forced download
+        r, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1",
+                        user="t34b", raw=True)
+        self.assertEqual(r.getheader("Content-Type"), "application/octet-stream")
+        self.assertTrue(r.getheader("Content-Disposition").startswith("attachment"))
+        self.confirm("t34b", [mid])
+
+    def test_35_forged_images_never_inline(self):
+        self.fresh("t35a", "t35b")
+        cases = {  # name lies about the content in every case
+            "evil.png": b"<html><script>alert(1)</script></html>",
+            "pic.jpg": b"\x89PNGnot-really" + b"x" * 20,   # wrong magic
+            "art.svg": b'<svg xmlns="http://www.w3.org/2000/svg">'
+                       b"<script>alert(1)</script></svg>",
+        }
+        for name, payload in cases.items():
+            up = self.upload("t35a", payload, name)
+            self.assertNotIn("image", up, name)   # never detected as image
+            sent = self.send_msg("t35a", name, to="t35b",
+                                 files=[up["file_id"]])
+            mid, gid = sent["id"], sent["gid"]
+            self.poll_until("t35b", lambda e, m=mid: e["id"] == m)
+            _, m = self.req("GET", f"/api/message/dequeue/{mid}", user="t35b")
+            self.assertNotIn("image", m["attachments"][0], name)
+            # inline=1 CANNOT force rendering: still an octet-stream download
+            r, _ = self.req("GET",
+                            f"/api/attachments/{gid}/{mid}/1?inline=1",
+                            user="t35b", raw=True)
+            self.assertEqual(r.getheader("Content-Type"),
+                             "application/octet-stream", name)
+            self.assertTrue(r.getheader("Content-Disposition")
+                            .startswith("attachment"), name)
+            self.confirm("t35b", [mid])
+
+    def test_36_other_image_magics_detected(self):
+        self.fresh("t36a")
+        for payload, mime in (
+            (b"GIF89a" + b"\x00" * 16, "image/gif"),
+            (b"\xff\xd8\xff\xe0" + b"\x00" * 16, "image/jpeg"),
+            (b"RIFF\x24\x00\x00\x00WEBP" + b"\x00" * 8, "image/webp"),
+        ):
+            up = self.upload("t36a", payload, "f.bin")  # name is irrelevant
+            self.assertEqual(up.get("image"), mime)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

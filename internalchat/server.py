@@ -170,7 +170,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(api.list_users())
         if len(p) == 4 and p[0] == "attachments":
             blob, meta = api.attachment(self._user(), p[1], p[2], p[3])
-            return self._send_blob(blob, meta["name"], meta["size"])
+            # inline rendering is allowed ONLY for images the server verified
+            # by magic bytes at upload — the request cannot force it
+            inline = (q.get("inline", ["0"])[0] == "1"
+                      and bool(meta.get("image")))
+            return self._send_blob(blob, meta["name"], meta["size"],
+                                   ctype=meta["image"] if inline
+                                   else "application/octet-stream",
+                                   inline=inline)
         if p == ["client", "version"]:
             if self.static_dir and (self.static_dir / "version.json").is_file():
                 return self._send_static(self.static_dir / "version.json")
@@ -178,15 +185,24 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "not found")
 
     # ---- byte responses ------------------------------------------------------
-    def _send_blob(self, path: Path, name: str, size: int) -> None:
-        """Attachments: always opaque bytes, always a download — never
-        rendered from this origin, regardless of content."""
+    def _send_blob(self, path: Path, name: str, size: int,
+                   ctype: str = "application/octet-stream",
+                   inline: bool = False) -> None:
+        """Attachments: opaque bytes. Default is a forced download. `inline`
+        is used only for images the server verified by magic bytes at upload;
+        even then, a CSP sandbox rides along so the bytes can never act as a
+        document with script, and nosniff pins the declared type."""
         ascii_name = name.encode("ascii", "replace").decode().replace('"', "_")
+        disp = "inline" if inline else "attachment"
         self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Type", ctype)
         self.send_header("X-Content-Type-Options", "nosniff")
+        if inline:
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; sandbox")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Content-Disposition",
-                         f'attachment; filename="{ascii_name}"; '
+                         f'{disp}; filename="{ascii_name}"; '
                          f"filename*=UTF-8''{quote(name)}")
         self.send_header("Content-Length", str(size))
         self.end_headers()
