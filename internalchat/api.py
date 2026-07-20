@@ -86,10 +86,15 @@ class Api:
         if items or time.time() >= deadline:
             return {"queue": items}
         with self._poll_lock:
-            if self._polls.get(user, 0) >= MAX_POLLS_PER_USER:
-                time.sleep(0.5)          # too many parked: brief pause so a
-                return {"queue": items}  # naive client can't hot-spin
-            self._polls[user] = self._polls.get(user, 0) + 1
+            over = self._polls.get(user, 0) >= MAX_POLLS_PER_USER
+            if not over:
+                self._polls[user] = self._polls.get(user, 0) + 1
+        if over:
+            # too many parked: pause OUTSIDE the lock (holding it across the
+            # sleep would serialize every user's poll-cap check) so a naive
+            # client can't hot-spin, then return.
+            time.sleep(0.5)
+            return {"queue": items}
         try:
             while True:
                 items = self._queue_items(user)
