@@ -479,8 +479,10 @@ class Api:
                 raise ApiError(400, "group full")
             if (md / u).exists():
                 continue
-            (md / u).touch()  # marker first: the join announcement below must
-            self.store.spool_system(  # not predate the join timestamp
+            # stamp the join time first (on the shared clock), so the join
+            # announcement's id — minted next — is strictly after it
+            (md / u).write_text(str(self.store.next_ts()))
+            self.store.spool_system(
                 user, gid, f"{user} added {u}",
                 {"event": "join", "user": u, "by": user})
         for u in remove:

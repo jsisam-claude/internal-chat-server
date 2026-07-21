@@ -929,6 +929,25 @@ class ChatServerTest(unittest.TestCase):
                             chatserver.Router(self.store, chatserver.Notifier()))
         self.assertIsNot(self.api._polls, a2._polls)
 
+    def test_45_join_stamp_on_message_clock(self):
+        # join time is stamped INTO the marker on the same monotonic clock as
+        # message ids — not filesystem mtime — so the pre-join gate can't be
+        # fooled by clock skew and needs no sleeps to order correctly
+        self.fresh("t45a", "t45b", "t45c")
+        _, g = self.req("POST", "/api/groups", user="t45a",
+                        body={"name": "clock", "members": ["t45b"]})
+        gid = g["gid"]
+        mid = self.send_msg("t45a", "before c", gid=gid)["id"]
+        self.req("POST", f"/api/groups/{gid}/members", user="t45a",
+                 body={"add": ["t45c"]})
+        marker = self.store.group_dir(gid) / "members" / "t45c"
+        stamp = int(marker.read_text())          # numeric stamp in the marker
+        self.assertGreater(stamp, int(mid[:13]))  # carol joined AFTER the msg id
+        self.assertEqual(self.store.joined_at(gid, "t45c"), stamp)
+        # and history hides the pre-join message from carol with no sleeps
+        _, hist = self.req("GET", f"/api/groups/{gid}/messages", user="t45c")
+        self.assertNotIn(mid, {m["id"] for m in hist["messages"]})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

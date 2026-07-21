@@ -36,11 +36,11 @@ class Store:
         except (OSError, ValueError):
             self._last_ms = 0
 
-    def next_mid(self) -> str:
-        """Sorted listings are the timeline, so ids must be STRICTLY
-        increasing — even across a restart or an NTP step back. The high-water
-        mark is persisted, and each id is at least the previous + 1ms, so two
-        sends never share a timestamp prefix (deterministic ordering)."""
+    def next_ts(self) -> int:
+        """A strictly-increasing millisecond stamp on ONE clock — persisted and
+        monotonic even across a restart or an NTP step back. Message ids AND
+        member join stamps both draw from this, so they are directly comparable
+        (the join-time history/tick gate can't be fooled by clock skew)."""
         with self._id_lock:
             ms = max(now_ms(), self._last_ms + 1)
             self._last_ms = ms
@@ -48,7 +48,10 @@ class Store:
                 self.write_atomic(self._hwm_path, str(ms).encode())
             except OSError:
                 pass  # persistence is best-effort; ordering still holds in-process
-        return f"{ms:013d}-{secrets.token_hex(6)}"
+        return ms
+
+    def next_mid(self) -> str:
+        return f"{self.next_ts():013d}-{secrets.token_hex(6)}"
 
     # ---- paths -----------------------------------------------------------
     def user_dir(self, user: str) -> Path:
@@ -193,10 +196,18 @@ class Store:
         return f.read_text() if f.is_file() else None
 
     def joined_at(self, gid: str, user: str) -> int:
-        """The membership marker's mtime IS the join timestamp; members only
-        see history from their join onward (WhatsApp group semantics)."""
+        """Join timestamp on the SAME clock as message ids (members see history
+        only from their join onward — WhatsApp group semantics). The marker
+        file holds the stamp; an empty legacy marker falls back to its mtime."""
+        p = self.group_dir(gid) / "members" / user
         try:
-            return int((self.group_dir(gid) / "members" / user).stat().st_mtime * 1000)
+            txt = p.read_text().strip()
+        except OSError:
+            return 0
+        if txt:
+            return int(txt)
+        try:
+            return int(p.stat().st_mtime * 1000)   # pre-stamp marker
         except OSError:
             return 0
 
@@ -204,8 +215,9 @@ class Store:
         """Build the group dir in tmp/, then atomically rename into place."""
         b = self.root / "tmp" / f"g-{secrets.token_hex(8)}"
         (b / "members").mkdir(parents=True)
+        stamp = str(self.next_ts())   # all founding members join "now"
         for u in sorted(members):
-            (b / "members" / u).touch()
+            (b / "members" / u).write_text(stamp)
         if name:
             (b / "name").write_text(name)
         try:

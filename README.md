@@ -64,6 +64,14 @@ login → send → queue → dequeue (peek/confirm) → delivered + read flags �
 groups → attachment upload/download, plus authorization, validation,
 rate-limit, and upload-inertness checks.
 
+`tests/load_test.py` is a separate concurrency load test (not picked up by
+`discover`) — run it explicitly to verify the connection cap, parked-poll
+cap, and no-cross-user-stall behavior under real load:
+
+```bash
+python3 tests/load_test.py
+```
+
 ## The one-glance tour
 
 ```
