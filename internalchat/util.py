@@ -57,6 +57,23 @@ def image_mime(head: bytes) -> str | None:
     return None
 
 
+def audio_mime(head: bytes) -> str | None:
+    """Detect a SAFE-to-play-inline audio container from magic bytes only —
+    same rules as image_mime: constant-byte comparison, never parsing, never
+    the filename. Allowlist: webm/ogg (what MediaRecorder produces), mp4/m4a
+    (Safari's MediaRecorder), mp3. Anything else stays a download."""
+    if head.startswith(b"\x1a\x45\xdf\xa3"):          # EBML (webm)
+        return "audio/webm"
+    if head.startswith(b"OggS"):
+        return "audio/ogg"
+    if len(head) >= 8 and head[4:8] == b"ftyp":       # ISO-BMFF (mp4/m4a)
+        return "audio/mp4"
+    if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF
+                                   and (head[1] & 0xE0) == 0xE0):
+        return "audio/mpeg"
+    return None
+
+
 def msg_dirs_newest_first(gdir: Path):
     """All message dirs of a group, newest first — the one directory-walk
     used by history, previews, and recovery."""

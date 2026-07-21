@@ -115,7 +115,7 @@ class Store:
         d = self.user_dir(user)
         if d.exists():
             raise ApiError(409, "user exists")
-        for sub in ("sessions", "queue", "staged", "nonces"):
+        for sub in ("sessions", "queue", "staged", "nonces", "starred"):
             (d / sub).mkdir(parents=True)
         salt = secrets.token_bytes(16)
         h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, self.iters)
@@ -275,7 +275,8 @@ class Store:
         return b
 
     def spool_message(self, sender: str, gid: str, text: str,
-                      staged: list[str], nonce: str) -> str:
+                      staged: list[str], nonce: str,
+                      reply_to: str | None = None) -> str:
         nf = self.user_dir(sender) / "nonces" / nonce
         # Claim the nonce atomically as an EMPTY file before any work. The mid
         # is written into it only after the message is durably spooled, so a
@@ -299,6 +300,8 @@ class Store:
                     raise ApiError(400, "unknown file id (upload first)")
                 srcs.append((src, meta))
             b = self._spool_dir(mid, gid, sender, text)
+            if reply_to:   # validated by the api layer before spooling
+                (b / "reply_to").write_text(reply_to)
             try:
                 for i, (src, meta) in enumerate(srcs, 1):
                     os.replace(src, b / "attachments" / str(i))

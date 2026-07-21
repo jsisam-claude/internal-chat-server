@@ -78,12 +78,20 @@ python3 tests/load_test.py
 data/
 ├── incoming/                       # accepted, awaiting routing (the queue)
 ├── users/<u>/queue/                # symlinks: new messages + flag events
-├── users/<u>/{staged,nonces,sessions,auth.json}
+│                                   #   (~d~ delivered, ~r~ read, ~x~ bounced,
+│                                   #    ~a~ reaction, ~u~ edited/deleted)
+├── users/<u>/{staged,nonces,sessions,starred,auth.json}
 ├── groups/<gid>/members/<u>        # roster = marker files
 ├── groups/<gid>/<date>/<msg-id>/   # message.txt, from, attachments/,
-│                                   # deliveredto/<u>, readby/<u>  (markers)
+│                                   # deliveredto/<u>, readby/<u>,
+│                                   # reactions/<u> (=emoji), reply_to,
+│                                   # edited, deleted  (all markers)
 └── {tmp,archive,rejected}/
 ```
+
+Ephemeral signals (typing, online presence) deliberately live in server
+memory only — they expire in seconds and are never written to disk. Search
+(`GET /api/search?q=`) is a bounded, newest-first walk of the same folders.
 
 A message's tick state is literally `ls`:
 

@@ -4,9 +4,11 @@ these methods, and serializes the result."""
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import secrets
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -16,9 +18,13 @@ from .config import (
     MAX_TEXT, MAX_FILE, MAX_ATTACHMENTS, MAX_STAGED, MAX_WAIT,
     MAX_GROUP_MEMBERS, SEND_LIMIT, SEND_WINDOW, UPLOAD_LIMIT, UPLOAD_WINDOW,
     LOGIN_WINDOW, LOGIN_USER_LIMIT, LOGIN_IP_LIMIT, USER_STORAGE_QUOTA,
-    GROUP_OP_LIMIT, GROUP_OP_WINDOW, MAX_POLLS_PER_USER)
+    GROUP_OP_LIMIT, GROUP_OP_WINDOW, MAX_POLLS_PER_USER,
+    SEARCH_LIMIT, SEARCH_WINDOW, SEARCH_SCAN_CAP, MAX_SEARCH_Q,
+    MAX_REACTION, MAX_STARS, TYPING_TTL, TYPING_CAP,
+    PRESENCE_ONLINE_SECS, LASTSEEN_PERSIST_SECS)
 from .errors import ApiError
-from .util import now_ms, sanitize_filename, msg_dirs_newest_first, image_mime
+from .util import (now_ms, sanitize_filename, msg_dirs_newest_first,
+                   image_mime, audio_mime)
 from .ratelimit import RateLimiter
 from .store import Store
 from .notifier import Notifier
@@ -37,13 +43,22 @@ class Api:
         self.upload_limiter = RateLimiter(limit=UPLOAD_LIMIT, window=UPLOAD_WINDOW)
         self.group_limiter = RateLimiter(limit=GROUP_OP_LIMIT,
                                          window=GROUP_OP_WINDOW)
+        self.search_limiter = RateLimiter(limit=SEARCH_LIMIT,
+                                          window=SEARCH_WINDOW)
         self.limiters = [self.login_limiter, self.login_ip_limiter,
                          self.send_limiter, self.upload_limiter,
-                         self.group_limiter]
+                         self.group_limiter, self.search_limiter]
         # per-INSTANCE (not class) so two servers in one process don't share
         # a global parked-poll counter
         self._poll_lock = threading.Lock()
         self._polls: dict = {}   # user -> number of currently-parked long-polls
+        # Ephemeral state deliberately lives in MEMORY, not files: typing and
+        # presence are signals that expire in seconds — writing markers for
+        # them would churn the disk for state nobody should ever recover.
+        self._typing_lock = threading.Lock()
+        self._typing: dict = {}      # (gid, user) -> expiry (time.time())
+        self._seen: dict = {}        # user -> last authenticated activity
+        self._seen_persisted: dict = {}   # user -> last time we wrote lastseen
 
     # ---- auth --------------------------------------------------------------
     def login(self, ip: str, body: dict) -> dict:
@@ -76,6 +91,73 @@ class Api:
                 s.unlink(missing_ok=True)
         return {"ok": True}
 
+    # ---- presence (ephemeral, in-memory) -----------------------------------
+    def touch_seen(self, user: str) -> None:
+        """Called on every authenticated request. Memory is the truth;
+        users/<u>/lastseen is written at most every LASTSEEN_PERSIST_SECS so a
+        restart still knows a coarse last-seen without per-request disk churn."""
+        now = time.time()
+        self._seen[user] = now
+        if now - self._seen_persisted.get(user, 0) > LASTSEEN_PERSIST_SECS:
+            self._seen_persisted[user] = now
+            try:
+                self.store.write_atomic(self.store.user_dir(user) / "lastseen",
+                                        str(int(now * 1000)).encode())
+            except OSError:
+                pass
+
+    def _last_seen_ms(self, user: str) -> int | None:
+        ts = self._seen.get(user)
+        if ts:
+            return int(ts * 1000)
+        try:
+            return int((self.store.user_dir(user) / "lastseen").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _online(self, user: str) -> bool:
+        return (time.time() - self._seen.get(user, 0) < PRESENCE_ONLINE_SECS
+                or self._polls.get(user, 0) > 0)
+
+    # ---- typing (ephemeral, in-memory) --------------------------------------
+    def typing(self, user: str, body: dict) -> dict:
+        gid = body.get("gid", "")
+        if not (isinstance(gid, str) and GID_RE.match(gid)):
+            raise ApiError(400, "bad group id")
+        if not self.store.is_member(gid, user):
+            raise ApiError(403, "not a member")
+        with self._typing_lock:
+            now = time.time()
+            for k in [k for k, exp in self._typing.items() if exp <= now]:
+                del self._typing[k]
+            if len(self._typing) < TYPING_CAP:
+                self._typing[(gid, user)] = now + TYPING_TTL
+        for u in self.store.members(gid):
+            if u != user:
+                self.notifier.notify(u)   # wake their parked polls
+        return {"ok": True}
+
+    def _typing_for(self, user: str) -> dict:
+        """{gid: {typist: int(expiry)}} for groups `user` belongs to. The
+        expiry is included so a parked poll detects a re-ping (same set, new
+        expiry) as a change and keeps the watcher's indicator alive."""
+        with self._typing_lock:
+            now = time.time()
+            snapshot = [(g, u, exp) for (g, u), exp in self._typing.items()
+                        if exp > now and u != user]
+        out: dict = {}
+        member_of: dict = {}
+        for g, u, exp in snapshot:
+            if g not in member_of:
+                member_of[g] = self.store.is_member(g, user)
+            if member_of[g]:
+                out.setdefault(g, {})[u] = int(exp)
+        return out
+
+    @staticmethod
+    def _typing_payload(t: dict) -> dict:
+        return {g: sorted(users) for g, users in t.items()}
+
     # ---- queue -------------------------------------------------------------
     def list_queue(self, user: str, wait: float) -> dict:
         deadline = time.time() + max(0.0, min(wait, MAX_WAIT))
@@ -83,8 +165,9 @@ class Api:
         # user, so one account can't tie up unbounded worker threads by opening
         # many concurrent long-polls.
         items = self._queue_items(user)
+        typing = self._typing_for(user)
         if items or time.time() >= deadline:
-            return {"queue": items}
+            return self._queue_resp(items, typing)
         with self._poll_lock:
             over = self._polls.get(user, 0) >= MAX_POLLS_PER_USER
             if not over:
@@ -94,12 +177,15 @@ class Api:
             # sleep would serialize every user's poll-cap check) so a naive
             # client can't hot-spin, then return.
             time.sleep(0.5)
-            return {"queue": items}
+            return self._queue_resp(items, typing)
         try:
             while True:
                 items = self._queue_items(user)
-                if items or time.time() >= deadline:
-                    return {"queue": items}
+                cur = self._typing_for(user)
+                # return on queue activity, deadline, or a typing-state CHANGE
+                # (start/stop/re-ping) — steady silence keeps the poll parked
+                if items or cur != typing or time.time() >= deadline:
+                    return self._queue_resp(items, cur)
                 self.notifier.wait(user, min(1.0, deadline - time.time()))
         finally:
             with self._poll_lock:
@@ -108,6 +194,12 @@ class Api:
                     self._polls[user] = n
                 else:
                     self._polls.pop(user, None)   # don't grow the dict forever
+
+    def _queue_resp(self, items: list, typing: dict) -> dict:
+        resp = {"queue": items}
+        if typing:
+            resp["typing"] = self._typing_payload(typing)
+        return resp
 
     def _queue_items(self, user: str) -> list[dict]:
         out = []
@@ -130,6 +222,7 @@ class Api:
                 continue
             item = {"entry": link.name,
                     "kind": {"d": "delivered", "r": "read", "x": "failed",
+                             "a": "reaction", "u": "updated",
                              None: "msg"}[kind],
                     "id": mid, "gid": gid, "at": at}
             if uid:
@@ -246,10 +339,114 @@ class Api:
             raise ApiError(400, "need 'to' or 'gid'")
         if not self.store.is_member(gid, user):
             raise ApiError(403, "not a member")
+        reply_to = body.get("reply_to")
+        if reply_to is not None:
+            if not (isinstance(reply_to, str) and MID_RE.match(reply_to)):
+                raise ApiError(400, "bad reply_to")
+            # the quoted message must exist in THIS group and be visible to
+            # the sender (post-join) — no quoting across groups or history
+            if (int(reply_to[:13]) < self.store.joined_at(gid, user)
+                    or not self.store.msg_dir(gid, reply_to).is_dir()):
+                raise ApiError(404, "reply target not found")
         self.send_limiter.check(user)  # cap message/fan-out floods per user
-        mid = self.store.spool_message(user, gid, text, files, nonce)
+        mid = self.store.spool_message(user, gid, text, files, nonce, reply_to)
         self.router.wake.set()
         return {"id": mid, "gid": gid}
+
+    def _visible_mdir(self, user: str, gid: str, mid: str) -> Path:
+        """Resolve (gid, mid) to a message dir the user is allowed to touch:
+        member of the group, message exists, and not from before their join."""
+        if not (isinstance(gid, str) and GID_RE.match(gid)
+                and isinstance(mid, str) and MID_RE.match(mid)):
+            raise ApiError(400, "bad ids")
+        if not self.store.is_member(gid, user):
+            raise ApiError(403, "not a member")
+        if int(mid[:13]) < self.store.joined_at(gid, user):
+            raise ApiError(404, "no such message")   # pre-join: invisible
+        mdir = self.store.msg_dir(gid, mid)
+        if not mdir.is_dir():
+            raise ApiError(404, "no such message")
+        return mdir
+
+    def _fanout_event(self, gid: str, mid: str, kind: str, actor: str,
+                      mdir: Path) -> None:
+        """Queue a payload-less ~a~/~u~ event to EVERY member (including the
+        actor — their other devices need it too) and wake them. Receivers
+        refetch the message state; the entry itself carries no data."""
+        for u in self.store.members(gid):
+            self.store.queue_add(u, f"{mid}~{kind}~{actor}", mdir)
+            self.notifier.notify(u)
+
+    # ---- reactions / edit / delete ------------------------------------------
+    def react(self, user: str, body: dict) -> dict:
+        gid, mid = body.get("gid", ""), body.get("mid", "")
+        emoji = body.get("emoji") or ""
+        if not isinstance(emoji, str):
+            raise ApiError(400, "bad emoji")
+        if emoji and not (len(emoji) <= MAX_REACTION
+                          and len(emoji.encode()) <= 4 * MAX_REACTION
+                          and emoji.isprintable()):
+            raise ApiError(400, "bad emoji")
+        mdir = self._visible_mdir(user, gid, mid)
+        if (mdir / "system").exists():
+            raise ApiError(400, "cannot react to a system message")
+        self.send_limiter.check(user)   # reactions fan out like messages
+        rdir = mdir / "reactions"
+        rdir.mkdir(exist_ok=True)
+        if emoji:
+            self.store.write_atomic(rdir / user, emoji.encode())
+        else:
+            (rdir / user).unlink(missing_ok=True)   # empty = remove reaction
+        self._fanout_event(gid, mid, "a", user, mdir)
+        return {"ok": True, "reactions": self._reactions(mdir)}
+
+    def edit_message(self, user: str, body: dict) -> dict:
+        gid, mid = body.get("gid", ""), body.get("mid", "")
+        text = body.get("text", "")
+        if not (isinstance(text, str) and text.strip()
+                and len(text) <= MAX_TEXT):
+            raise ApiError(400, "bad text")
+        mdir = self._visible_mdir(user, gid, mid)
+        if (mdir / "from").read_text().strip() != user:
+            raise ApiError(403, "not your message")
+        if (mdir / "system").exists() or (mdir / "deleted").exists():
+            raise ApiError(400, "cannot edit this message")
+        self.send_limiter.check(user)
+        self.store.write_atomic(mdir / "message.txt", text.encode())
+        stamp = self.store.next_ts()
+        self.store.write_atomic(mdir / "edited", str(stamp).encode())
+        self._fanout_event(gid, mid, "u", user, mdir)
+        return {"ok": True, "edited": stamp}
+
+    def delete_message(self, user: str, body: dict) -> dict:
+        gid, mid = body.get("gid", ""), body.get("mid", "")
+        mdir = self._visible_mdir(user, gid, mid)
+        if (mdir / "from").read_text().strip() != user:
+            raise ApiError(403, "not your message")
+        if (mdir / "system").exists():
+            raise ApiError(400, "cannot delete a system message")
+        if (mdir / "deleted").exists():
+            return {"ok": True}   # idempotent
+        self.send_limiter.check(user)
+        # tombstone: blank the text, drop the attachment bytes (crediting the
+        # sender's storage back), and mark. The dir itself stays so queue
+        # entries, replies, and history render a coherent "deleted" stub.
+        freed = 0
+        adir = mdir / "attachments"
+        if adir.is_dir():
+            for metaf in adir.glob("*.meta"):
+                try:
+                    freed += json.loads(metaf.read_text()).get("size", 0)
+                except (OSError, ValueError):
+                    pass
+            shutil.rmtree(adir, ignore_errors=True)
+        self.store.write_atomic(mdir / "message.txt", b"")
+        self.store.write_atomic(mdir / "deleted",
+                                str(self.store.next_ts()).encode())
+        if freed:
+            self.store.add_storage(user, -freed)
+        self._fanout_event(gid, mid, "u", user, mdir)
+        return {"ok": True}
 
     def upload(self, user: str, rfile, length: int, rawname: str) -> dict:
         if length <= 0 or length > MAX_FILE:
@@ -286,8 +483,11 @@ class Api:
             meta = {"name": name, "size": length, "sha256": digest.hexdigest(),
                     "uploaded": now_ms()}
             mime = image_mime(head)
+            amime = None if mime else audio_mime(head)
             if mime:
                 meta["image"] = mime  # server-verified: the ONLY basis for inline
+            if amime:
+                meta["audio"] = amime  # ditto, for inline <audio> playback
             self.store.write_atomic(staged / (fid + ".meta"),
                                     json.dumps(meta).encode())
         except Exception:
@@ -296,6 +496,8 @@ class Api:
         out = {"file_id": fid, "name": name, "sha256": meta["sha256"]}
         if mime:
             out["image"] = mime
+        if amime:
+            out["audio"] = amime
         return out
 
     def _add_storage(self, udir: Path, delta: int) -> None:
@@ -333,6 +535,8 @@ class Api:
                          "sha256": meta["sha256"]}
                     if meta.get("image"):   # server-verified at upload
                         a["image"] = meta["image"]
+                    if meta.get("audio"):   # server-verified at upload
+                        a["audio"] = meta["audio"]
                     atts.append(a)
                 except (ValueError, KeyError):
                     continue
@@ -357,12 +561,45 @@ class Api:
                "recipients": recipients,
                "deliveredto": self._flags(mdir / "deliveredto"),
                "readby": self._flags(mdir / "readby")}
+        reactions = self._reactions(mdir)
+        if reactions:
+            out["reactions"] = reactions
+        try:
+            out["edited"] = int((mdir / "edited").read_text())
+        except (OSError, ValueError):
+            pass
+        if (mdir / "deleted").is_file():
+            # belt and braces: a deleted message renders empty even if the
+            # truncate raced or a stale attachment meta survived
+            out.update(deleted=True, text="", attachments=[])
+        rt = mdir / "reply_to"
+        if rt.is_file():
+            out["reply"] = self._resolve_reply(gid, rt)
         if (mdir / "system").is_file():
             try:
                 out["system"] = json.loads((mdir / "system").read_text())
             except ValueError:
                 out["system"] = {}
         return out
+
+    def _resolve_reply(self, gid: str, rt: Path) -> dict:
+        """Quoted-message stub, resolved fresh at read time so it tracks the
+        target's current state (edits show, a deleted target shows as such)."""
+        try:
+            tid = rt.read_text().strip()
+        except OSError:
+            return {"gone": True}
+        if not MID_RE.match(tid):        # corrupt marker: never build a path
+            return {"gone": True}
+        tdir = self.store.msg_dir(gid, tid)
+        try:
+            if (tdir / "deleted").is_file():
+                return {"id": tid, "deleted": True}
+            return {"id": tid,
+                    "from": (tdir / "from").read_text().strip(),
+                    "text": (tdir / "message.txt").read_text()[:160]}
+        except OSError:
+            return {"id": tid, "gone": True}   # archived/pruned target
 
     @staticmethod
     def _flags(folder: Path) -> dict:
@@ -371,18 +608,21 @@ class Api:
         except FileNotFoundError:
             return {}
 
+    @staticmethod
+    def _reactions(mdir: Path) -> dict:
+        try:
+            return {p.name: p.read_text() for p in (mdir / "reactions").iterdir()
+                    if USER_RE.match(p.name)}
+        except (FileNotFoundError, OSError):
+            return {}
+
     def state(self, user: str, gid: str, mid: str) -> dict:
+        """Full current render of one message. This is what clients refetch on
+        a ~a~/~u~ (reaction/update) queue event; it is a superset of the old
+        flags-only response, under the same authorization."""
         if not (GID_RE.match(gid) and MID_RE.match(mid)):
             raise ApiError(400, "bad ids")
-        if not self.store.is_member(gid, user):
-            raise ApiError(403, "not a member")
-        if int(mid[:13]) < self.store.joined_at(gid, user):
-            raise ApiError(404, "no such message")  # pre-join: invisible
-        mdir = self.store.msg_dir(gid, mid)
-        if not mdir.is_dir():
-            raise ApiError(404, "no such message")
-        return {"deliveredto": self._flags(mdir / "deliveredto"),
-                "readby": self._flags(mdir / "readby")}
+        return self.render_msg(self._visible_mdir(user, gid, mid))
 
     def history(self, user: str, gid: str, before: str | None, limit: int) -> dict:
         if not GID_RE.match(gid):
@@ -403,6 +643,124 @@ class Api:
             if len(out) >= limit:
                 break
         return {"messages": out}
+
+    # ---- starred (per-user, private — no fan-out) ---------------------------
+    def _starred_dir(self, user: str) -> Path:
+        d = self.store.user_dir(user) / "starred"
+        d.mkdir(exist_ok=True)   # users provisioned before this feature
+        return d
+
+    def star(self, user: str, body: dict) -> dict:
+        gid, mid = body.get("gid", ""), body.get("mid", "")
+        on = bool(body.get("on", True))
+        sdir = self._starred_dir(user)
+        marker = sdir / f"{gid}~{mid}"   # '~' can't appear in a gid or mid
+        if on:
+            self._visible_mdir(user, gid, mid)   # must be able to see it now
+            if sum(1 for _ in sdir.iterdir()) >= MAX_STARS:
+                raise ApiError(429, "too many starred messages")
+            marker.touch()
+        else:
+            if not (isinstance(gid, str) and GID_RE.match(gid)
+                    and isinstance(mid, str) and MID_RE.match(mid)):
+                raise ApiError(400, "bad ids")
+            marker.unlink(missing_ok=True)
+        return {"ok": True, "starred": on}
+
+    def starred(self, user: str) -> dict:
+        """The user's starred messages, newest first. Markers whose message is
+        gone (archived, deleted group, we left) are pruned as we encounter
+        them — the list is self-healing, like the queue."""
+        out = []
+        for marker in sorted(self._starred_dir(user).iterdir(),
+                             key=lambda p: p.name.split("~", 1)[-1],
+                             reverse=True):
+            gid, _, mid = marker.name.partition("~")
+            if not (GID_RE.match(gid) and MID_RE.match(mid)):
+                continue
+            mdir = self.store.msg_dir(gid, mid)
+            if (not self.store.is_member(gid, user) or not mdir.is_dir()
+                    or (mdir / "deleted").is_file()):
+                marker.unlink(missing_ok=True)
+                continue
+            out.append(self.render_msg(mdir))
+            if len(out) >= 200:
+                break
+        return {"messages": out}
+
+    # ---- search --------------------------------------------------------------
+    def search(self, user: str, q: str, gid: str | None, limit: int) -> dict:
+        """Case-insensitive substring scan over message text and attachment
+        names — literally walking the folders, newest first across every group
+        the user belongs to (or one gid). Join-time visibility is enforced per
+        group; work is bounded by SEARCH_SCAN_CAP dirs, and `truncated` tells
+        the client when the bound was hit before history was exhausted."""
+        if not (isinstance(q, str) and 1 <= len(q) <= MAX_SEARCH_Q):
+            raise ApiError(400, "bad query")
+        self.search_limiter.check(user)
+        limit = max(1, min(limit, 50))
+        if gid is not None:
+            if not GID_RE.match(gid):
+                raise ApiError(400, "bad group id")
+            if not self.store.is_member(gid, user):
+                raise ApiError(403, "not a member")
+            gids = [gid]
+        else:
+            gids = [g.name for g in (self.store.root / "groups").iterdir()
+                    if (g / "members" / user).exists()]
+        joined = {g: self.store.joined_at(g, user) for g in gids}
+
+        def visible(g):
+            for mdir in msg_dirs_newest_first(self.store.group_dir(g)):
+                if int(mdir.name[:13]) < joined[g]:
+                    break
+                yield mdir
+        # merge the per-group newest-first streams into one global
+        # newest-first stream (mids are ordered by their timestamp prefix)
+        merged = heapq.merge(*(visible(g) for g in gids),
+                             key=lambda p: p.name, reverse=True)
+        ql = q.lower()
+        results, scanned, truncated = [], 0, False
+        for mdir in merged:
+            scanned += 1
+            if scanned > SEARCH_SCAN_CAP:
+                truncated = True
+                break
+            try:
+                if (mdir / "deleted").is_file() or (mdir / "system").is_file():
+                    continue
+                text = (mdir / "message.txt").read_text()
+                hit = ql in text.lower()
+                att_hit = None
+                if not hit:
+                    for metaf in (mdir / "attachments").glob("*.meta"):
+                        name = json.loads(metaf.read_text()).get("name", "")
+                        if ql in name.lower():
+                            att_hit = name
+                            break
+                    if att_hit is None:
+                        continue
+                results.append({
+                    "id": mdir.name,
+                    "gid": self.store.gid_of(mdir),
+                    "from": (mdir / "from").read_text().strip(),
+                    "at": int(mdir.name[:13]),
+                    "snippet": ("\U0001F4CE " + att_hit) if att_hit
+                               else self._snippet(text, ql)})
+                if len(results) >= limit:
+                    break
+            except OSError:
+                continue   # janitor archived it mid-scan
+        return {"results": results, "truncated": truncated}
+
+    @staticmethod
+    def _snippet(text: str, ql: str) -> str:
+        i = text.lower().find(ql)
+        if i < 0:
+            return text[:120]
+        start, end = max(0, i - 60), min(len(text), i + len(ql) + 60)
+        return (("…" if start else "") + text[start:end]
+                + ("…" if end < len(text) else ""))
 
     # ---- groups / directory --------------------------------------------------
     def list_groups(self, user: str) -> dict:
@@ -426,10 +784,13 @@ class Api:
                 text = (mdir / "message.txt").read_text()
             except OSError:
                 continue
-            return {"id": mdir.name, "at": int(mdir.name[:13]),
+            last = {"id": mdir.name, "at": int(mdir.name[:13]),
                     "from": (mdir / "from").read_text().strip(),
                     "text": text[:80],
                     "attachments": len(list((mdir / "attachments").glob("*.meta")))}
+            if (mdir / "deleted").is_file():
+                last["deleted"] = True
+            return last
         return None
 
     def create_group(self, user: str, body: dict) -> dict:
@@ -517,6 +878,11 @@ class Api:
                 auth = json.loads((udir / "auth.json").read_text())
             except (OSError, ValueError):
                 continue
-            res.append({"user": udir.name, "display": auth.get("display", udir.name)})
+            u = {"user": udir.name, "display": auth.get("display", udir.name),
+                 "online": self._online(udir.name)}
+            seen = self._last_seen_ms(udir.name)
+            if seen:
+                u["last_seen"] = seen
+            res.append(u)
         return {"users": res}
 

@@ -948,6 +948,258 @@ class ChatServerTest(unittest.TestCase):
         _, hist = self.req("GET", f"/api/groups/{gid}/messages", user="t45c")
         self.assertNotIn(mid, {m["id"] for m in hist["messages"]})
 
+    # ---- v2 features: reactions, reply, edit/delete, search, star,
+    # ---- presence, typing, voice-note audio ---------------------------------
+
+    def test_46_reaction_roundtrip_and_event(self):
+        self.fresh("t46a", "t46b")
+        sent = self.send_msg("t46a", "react to me", to="t46b")
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t46b", lambda e: e["id"] == mid)
+        # bob reacts; marker file appears; state carries it
+        status, r = self.req("POST", "/api/message/react", user="t46b",
+                             body={"gid": gid, "mid": mid, "emoji": "👍"})
+        self.assertEqual(status, 200, r)
+        self.assertEqual(r["reactions"], {"t46b": "👍"})
+        self.assertEqual(
+            (self.store.msg_dir(gid, mid) / "reactions" / "t46b").read_text(),
+            "👍")
+        # alice gets a ~a~ reaction event and refetches state
+        ev = self.poll_until("t46a", lambda e: e["kind"] == "reaction"
+                             and e["id"] == mid)
+        self.assertEqual(ev["user"], "t46b")
+        _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t46a")
+        self.assertEqual(st["reactions"], {"t46b": "👍"})
+        self.assertIn("deliveredto", st)   # still a superset of the old shape
+        # removing = empty emoji; marker gone
+        self.req("POST", "/api/message/react", user="t46b",
+                 body={"gid": gid, "mid": mid, "emoji": ""})
+        _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t46a")
+        self.assertNotIn("reactions", st)
+
+    def test_47_reaction_validation(self):
+        self.fresh("t47a", "t47b", "t47x")
+        sent = self.send_msg("t47a", "hi", to="t47b")
+        mid, gid = sent["id"], sent["gid"]
+        # non-member cannot react
+        status, _ = self.req("POST", "/api/message/react", user="t47x",
+                             body={"gid": gid, "mid": mid, "emoji": "👍"})
+        self.assertEqual(status, 403)
+        # junk emoji rejected (control chars / oversized)
+        for bad in ("a\x00b", "x" * 40):
+            status, _ = self.req("POST", "/api/message/react", user="t47a",
+                                 body={"gid": gid, "mid": mid, "emoji": bad})
+            self.assertEqual(status, 400, bad)
+
+    def test_48_reply_roundtrip(self):
+        self.fresh("t48a", "t48b")
+        orig = self.send_msg("t48a", "original question", to="t48b")
+        mid, gid = orig["id"], orig["gid"]
+        self.poll_until("t48b", lambda e: e["id"] == mid)
+        body = {"text": "the answer", "nonce": "n-" + os.urandom(8).hex(),
+                "gid": gid, "reply_to": mid}
+        status, rep = self.req("POST", "/api/messages", user="t48b", body=body)
+        self.assertEqual(status, 200, rep)
+        ev = self.poll_until("t48a", lambda e: e["id"] == rep["id"])
+        _, msg = self.req("GET", f"/api/message/dequeue/{rep['id']}", user="t48a")
+        self.assertEqual(msg["reply"]["id"], mid)
+        self.assertEqual(msg["reply"]["from"], "t48a")
+        self.assertEqual(msg["reply"]["text"], "original question")
+        self.confirm("t48a", [ev["entry"]])
+        # a reply to a nonexistent mid is rejected
+        body = {"text": "x", "nonce": "n-" + os.urandom(8).hex(), "gid": gid,
+                "reply_to": "9999999999999-aaaaaaaaaaaa"}
+        status, _ = self.req("POST", "/api/messages", user="t48b", body=body)
+        self.assertEqual(status, 404)
+
+    def test_49_edit_message(self):
+        self.fresh("t49a", "t49b")
+        sent = self.send_msg("t49a", "teh typo", to="t49b")
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t49b", lambda e: e["id"] == mid)
+        # only the author may edit
+        status, _ = self.req("POST", "/api/message/edit", user="t49b",
+                             body={"gid": gid, "mid": mid, "text": "hax"})
+        self.assertEqual(status, 403)
+        status, r = self.req("POST", "/api/message/edit", user="t49a",
+                             body={"gid": gid, "mid": mid, "text": "the fix"})
+        self.assertEqual(status, 200, r)
+        # recipient gets an ~u~ updated event; state shows new text + edited ts
+        ev = self.poll_until("t49b", lambda e: e["kind"] == "updated"
+                             and e["id"] == mid)
+        _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t49b")
+        self.assertEqual(st["text"], "the fix")
+        self.assertEqual(st["edited"], r["edited"])
+        self.confirm("t49b", [ev["entry"]])
+
+    def test_50_delete_message_tombstone_and_storage_credit(self):
+        self.fresh("t50a", "t50b")
+        up = self.upload("t50a", b"PAYLOAD" * 1000, name="doc.bin")
+        sent = self.send_msg("t50a", "with file", to="t50b",
+                             files=[up["file_id"]])
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t50b", lambda e: e["id"] == mid)
+        used_before = self.store.storage_used("t50a")
+        self.assertGreaterEqual(used_before, 7000)
+        status, _ = self.req("POST", "/api/message/delete", user="t50a",
+                             body={"gid": gid, "mid": mid})
+        self.assertEqual(status, 200)
+        # tombstone: text blank, deleted flag, attachments gone (404), quota back
+        _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t50b")
+        self.assertTrue(st["deleted"])
+        self.assertEqual(st["text"], "")
+        self.assertEqual(st["attachments"], [])
+        status, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1",
+                             user="t50b")
+        self.assertEqual(status, 404)
+        self.assertEqual(self.store.storage_used("t50a"), used_before - 7000)
+        # idempotent; and the recipient saw an updated event
+        status, _ = self.req("POST", "/api/message/delete", user="t50a",
+                             body={"gid": gid, "mid": mid})
+        self.assertEqual(status, 200)
+        self.poll_until("t50b", lambda e: e["kind"] == "updated")
+
+    def test_51_search_scope_and_join_gate(self):
+        self.fresh("t51a", "t51b", "t51c")
+        gid = self.send_msg("t51a", "zebra in the dm", to="t51b")["gid"]
+        _, g = self.req("POST", "/api/groups", user="t51a",
+                        body={"name": "srch", "members": ["t51b"]})
+        self.send_msg("t51a", "zebra pre-join", gid=g["gid"])
+        self.req("POST", f"/api/groups/{g['gid']}/members", user="t51a",
+                 body={"add": ["t51c"]})
+        self.send_msg("t51a", "zebra post-join", gid=g["gid"])
+        # alice sees both group hits and the dm hit
+        _, res = self.req("GET", "/api/search?q=zebra", user="t51a")
+        texts = [r["snippet"] for r in res["results"]]
+        self.assertEqual(len(texts), 3, texts)
+        self.assertFalse(res["truncated"])
+        # newest-first ordering across groups
+        ats = [r["at"] for r in res["results"]]
+        self.assertEqual(ats, sorted(ats, reverse=True))
+        # carol joined late: pre-join message is invisible to search
+        _, res = self.req("GET", "/api/search?q=zebra", user="t51c")
+        self.assertEqual([r["snippet"] for r in res["results"]],
+                         ["zebra post-join"])
+        # non-member scoping to a gid is refused
+        status, _ = self.req("GET", f"/api/search?q=zebra&gid={gid}",
+                             user="t51c")
+        self.assertEqual(status, 403)
+        # attachment-name matches hit too
+        up = self.upload("t51a", b"\x00binary", name="zebra-report.pdf")
+        self.send_msg("t51a", "", to="t51b", files=[up["file_id"]])
+        _, res = self.req("GET", "/api/search?q=zebra-report", user="t51b")
+        self.assertEqual(len(res["results"]), 1)
+        self.assertIn("zebra-report.pdf", res["results"][0]["snippet"])
+
+    def test_52_star_roundtrip_and_selfheal(self):
+        self.fresh("t52a", "t52b")
+        sent = self.send_msg("t52a", "star me", to="t52b")
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t52b", lambda e: e["id"] == mid)
+        status, _ = self.req("POST", "/api/message/star", user="t52b",
+                             body={"gid": gid, "mid": mid, "on": True})
+        self.assertEqual(status, 200)
+        _, ls = self.req("GET", "/api/starred", user="t52b")
+        self.assertEqual([m["id"] for m in ls["messages"]], [mid])
+        self.assertEqual(ls["messages"][0]["text"], "star me")
+        # stars are private: alice's list is empty
+        _, ls = self.req("GET", "/api/starred", user="t52a")
+        self.assertEqual(ls["messages"], [])
+        # deleting the message self-heals the star list on next read
+        self.req("POST", "/api/message/delete", user="t52a",
+                 body={"gid": gid, "mid": mid})
+        _, ls = self.req("GET", "/api/starred", user="t52b")
+        self.assertEqual(ls["messages"], [])
+        self.assertEqual(list((self.store.user_dir("t52b") / "starred")
+                              .iterdir()), [])
+        # unstar of something never starred is a no-op, not an error
+        status, _ = self.req("POST", "/api/message/star", user="t52b",
+                             body={"gid": gid, "mid": mid, "on": False})
+        self.assertEqual(status, 200)
+
+    def test_53_presence_in_users_list(self):
+        self.fresh("t53a")
+        _, res = self.req("GET", "/api/users", user="t53a")
+        me = next(u for u in res["users"] if u["user"] == "t53a")
+        self.assertTrue(me["online"])           # we just made a request
+        self.assertGreater(me.get("last_seen", 0), 0)
+        # a user who has never authenticated is offline
+        self.store.add_user("t53ghost", "pw-x", must_change=False)
+        _, res = self.req("GET", "/api/users", user="t53a")
+        ghost = next(u for u in res["users"] if u["user"] == "t53ghost")
+        self.assertFalse(ghost["online"])
+
+    def test_54_typing_signal(self):
+        self.fresh("t54a", "t54b")
+        gid = self.send_msg("t54a", "warm up the dm", to="t54b")["gid"]
+        for e in self.poll("t54b"):
+            self.confirm("t54b", [e["entry"]])
+        status, _ = self.req("POST", "/api/typing", user="t54a",
+                             body={"gid": gid})
+        self.assertEqual(status, 200)
+        # bob's poll reports alice typing; alice's own poll must NOT echo her
+        status, resp = self.req("GET", "/api/messages?wait=0", user="t54b")
+        self.assertEqual(resp.get("typing"), {gid: ["t54a"]})
+        status, resp = self.req("GET", "/api/messages?wait=0", user="t54a")
+        self.assertNotIn("typing", resp)
+        # non-member gets a 403 and no signal
+        self.fresh("t54x")
+        status, _ = self.req("POST", "/api/typing", user="t54x",
+                             body={"gid": gid})
+        self.assertEqual(status, 403)
+
+    def test_55_voice_note_audio_verified_inline(self):
+        self.fresh("t55a", "t55b")
+        # a real-looking webm/EBML header → audio, inline allowed
+        up = self.upload("t55a", b"\x1a\x45\xdf\xa3" + b"\x00" * 64,
+                         name="voice.webm")
+        self.assertEqual(up["audio"], "audio/webm")
+        sent = self.send_msg("t55a", "", to="t55b", files=[up["file_id"]])
+        mid, gid = sent["id"], sent["gid"]
+        ev = self.poll_until("t55b", lambda e: e["id"] == mid)
+        _, msg = self.req("GET", f"/api/message/dequeue/{mid}", user="t55b")
+        self.assertEqual(msg["attachments"][0]["audio"], "audio/webm")
+        r, payload = self.req("GET", f"/api/attachments/{gid}/{mid}/1?inline=1",
+                              user="t55b", raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.headers["Content-Type"], "audio/webm")
+        self.assertIn("sandbox", r.headers.get("Content-Security-Policy", ""))
+        self.confirm("t55b", [ev["entry"]])
+        # an html file named .webm is NOT audio and stays a forced download
+        up = self.upload("t55a", b"<html><script>x</script></html>",
+                         name="fake.webm")
+        self.assertNotIn("audio", up)
+        sent = self.send_msg("t55a", "", to="t55b", files=[up["file_id"]])
+        ev = self.poll_until("t55b", lambda e: e["id"] == sent["id"])
+        self.confirm("t55b", [ev["entry"]])   # wait until the router routed it
+        r, payload = self.req(
+            "GET", f"/api/attachments/{sent['gid']}/{sent['id']}/1?inline=1",
+            user="t55b", raw=True)
+        self.assertEqual(r.headers["Content-Type"], "application/octet-stream")
+        self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
+
+    def test_56_edit_delete_guards(self):
+        self.fresh("t56a", "t56b")
+        sent = self.send_msg("t56a", "guard me", to="t56b")
+        mid, gid = sent["id"], sent["gid"]
+        # cannot edit a deleted message; cannot delete someone else's
+        status, _ = self.req("POST", "/api/message/delete", user="t56b",
+                             body={"gid": gid, "mid": mid})
+        self.assertEqual(status, 403)
+        self.req("POST", "/api/message/delete", user="t56a",
+                 body={"gid": gid, "mid": mid})
+        status, _ = self.req("POST", "/api/message/edit", user="t56a",
+                             body={"gid": gid, "mid": mid, "text": "zombie"})
+        self.assertEqual(status, 400)
+        # reactions on system messages are refused
+        _, g = self.req("POST", "/api/groups", user="t56a",
+                        body={"name": "sys", "members": ["t56b"]})
+        ev = self.poll_until("t56b", lambda e: e["gid"] == g["gid"])
+        status, _ = self.req("POST", "/api/message/react", user="t56b",
+                             body={"gid": g["gid"], "mid": ev["id"],
+                                   "emoji": "👍"})
+        self.assertEqual(status, 400)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

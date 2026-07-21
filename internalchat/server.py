@@ -76,6 +76,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.api.store.session_user(self._token)
         if not user:
             raise ApiError(401, "invalid or expired session")
+        self.api.touch_seen(user)   # presence: any authenticated call counts
         return user
 
     def do_GET(self):
@@ -134,6 +135,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(api.confirm(self._user(), p[3].split(",")))
             if p == ["message", "viewed"]:
                 return self._send_json(api.viewed(self._user(), self._json_body()))
+            if p == ["message", "react"]:
+                return self._send_json(api.react(self._user(), self._json_body()))
+            if p == ["message", "edit"]:
+                return self._send_json(api.edit_message(self._user(),
+                                                        self._json_body()))
+            if p == ["message", "delete"]:
+                return self._send_json(api.delete_message(self._user(),
+                                                          self._json_body()))
+            if p == ["message", "star"]:
+                return self._send_json(api.star(self._user(), self._json_body()))
+            if p == ["typing"]:
+                return self._send_json(api.typing(self._user(), self._json_body()))
             if p == ["files"]:
                 user = self._user()
                 try:
@@ -176,14 +189,24 @@ class Handler(BaseHTTPRequestHandler):
         if p == ["users"]:
             self._user()
             return self._send_json(api.list_users())
+        if p == ["starred"]:
+            return self._send_json(api.starred(self._user()))
+        if p == ["search"]:
+            try:
+                limit = int(q.get("limit", ["20"])[0])
+            except ValueError:
+                limit = 20
+            return self._send_json(api.search(
+                self._user(), q.get("q", [""])[0],
+                q.get("gid", [None])[0], limit))
         if len(p) == 4 and p[0] == "attachments":
             blob, meta = api.attachment(self._user(), p[1], p[2], p[3])
-            # inline rendering is allowed ONLY for images the server verified
+            # inline rendering is allowed ONLY for media the server verified
             # by magic bytes at upload — the request cannot force it
-            inline = (q.get("inline", ["0"])[0] == "1"
-                      and bool(meta.get("image")))
+            media = meta.get("image") or meta.get("audio")
+            inline = q.get("inline", ["0"])[0] == "1" and bool(media)
             return self._send_blob(blob, meta["name"], meta["size"],
-                                   ctype=meta["image"] if inline
+                                   ctype=media if inline
                                    else "application/octet-stream",
                                    inline=inline)
         if p == ["client", "version"]:
