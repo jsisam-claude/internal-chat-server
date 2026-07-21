@@ -15,8 +15,8 @@ from .config import (
     GID_RE, MID_RE, USER_RE, NONCE_RE, FID_RE, ENTRY_RE,
     MAX_TEXT, MAX_FILE, MAX_ATTACHMENTS, MAX_STAGED, MAX_WAIT,
     MAX_GROUP_MEMBERS, SEND_LIMIT, SEND_WINDOW, UPLOAD_LIMIT, UPLOAD_WINDOW,
-    LOGIN_IP_LIMIT, USER_STORAGE_QUOTA, GROUP_OP_LIMIT, GROUP_OP_WINDOW,
-    MAX_POLLS_PER_USER)
+    LOGIN_WINDOW, LOGIN_USER_LIMIT, LOGIN_IP_LIMIT, USER_STORAGE_QUOTA,
+    GROUP_OP_LIMIT, GROUP_OP_WINDOW, MAX_POLLS_PER_USER)
 from .errors import ApiError
 from .util import now_ms, sanitize_filename, msg_dirs_newest_first, image_mime
 from .ratelimit import RateLimiter
@@ -31,8 +31,8 @@ class Api:
         self.store = store
         self.notifier = notifier
         self.router = router
-        self.login_limiter = RateLimiter(limit=10, window=300)
-        self.login_ip_limiter = RateLimiter(limit=LOGIN_IP_LIMIT, window=300)
+        self.login_limiter = RateLimiter(limit=LOGIN_USER_LIMIT, window=LOGIN_WINDOW)
+        self.login_ip_limiter = RateLimiter(limit=LOGIN_IP_LIMIT, window=LOGIN_WINDOW)
         self.send_limiter = RateLimiter(limit=SEND_LIMIT, window=SEND_WINDOW)
         self.upload_limiter = RateLimiter(limit=UPLOAD_LIMIT, window=UPLOAD_WINDOW)
         self.group_limiter = RateLimiter(limit=GROUP_OP_LIMIT,
