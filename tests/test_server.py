@@ -1178,6 +1178,106 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(r.headers["Content-Type"], "application/octet-stream")
         self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
 
+    # ---- security regressions (found in the v2 adversarial review) ----------
+
+    def test_59_starred_enforces_join_gate(self):
+        # "star, leave, rejoin, harvest": a star survives leaving the group, so
+        # without a join-time gate the starred list serves content written
+        # while the user was NOT a member — content history() correctly hides.
+        self.fresh("t59a", "t59b")
+        _, g = self.req("POST", "/api/groups", user="t59a",
+                        body={"name": "s59", "members": ["t59b"]})
+        gid = g["gid"]
+        mid = self.send_msg("t59a", "v1 innocent", gid=gid)["id"]
+        self.poll_until("t59b", lambda e: e["id"] == mid)
+        self.req("POST", "/api/message/star", user="t59b",
+                 body={"gid": gid, "mid": mid, "on": True})
+        self.req("POST", f"/api/groups/{gid}/members", user="t59b",
+                 body={"remove": ["t59b"]})
+        self.req("POST", "/api/message/edit", user="t59a",
+                 body={"gid": gid, "mid": mid, "text": "SECRET while away"})
+        self.req("POST", f"/api/groups/{gid}/members", user="t59a",
+                 body={"add": ["t59b"]})
+        _, star = self.req("GET", "/api/starred", user="t59b")
+        texts = [m["text"] for m in star["messages"]]
+        self.assertNotIn("SECRET while away", texts)
+        # and consistent with the other read paths
+        status, _ = self.req("GET", f"/api/message/state/{gid}/{mid}",
+                             user="t59b")
+        self.assertEqual(status, 404)
+
+    def test_60_reply_stub_hides_pre_join_content(self):
+        # send() gates reply_to against the SENDER's join time, but the quote
+        # is resolved at READ time — so a reply must not quote pre-join content
+        # into a newly-added member's history.
+        self.fresh("t60a", "t60b", "t60c")
+        _, g = self.req("POST", "/api/groups", user="t60a",
+                        body={"name": "s60", "members": ["t60b"]})
+        gid = g["gid"]
+        secret = self.send_msg("t60a", "SECRET pre-join content", gid=gid)["id"]
+        self.poll_until("t60b", lambda e: e["id"] == secret)
+        self.req("POST", f"/api/groups/{gid}/members", user="t60a",
+                 body={"add": ["t60c"]})
+        body = {"gid": gid, "text": "agreed", "reply_to": secret,
+                "nonce": "n-" + os.urandom(8).hex()}
+        status, rep = self.req("POST", "/api/messages", user="t60b", body=body)
+        self.assertEqual(status, 200, rep)
+        self.poll_until("t60c", lambda e: e["id"] == rep["id"])
+        _, hist = self.req("GET", f"/api/groups/{gid}/messages", user="t60c")
+        for m in hist["messages"]:
+            self.assertNotIn("SECRET", (m.get("reply") or {}).get("text", ""))
+        # the original member still sees the quote normally
+        _, hist_b = self.req("GET", f"/api/groups/{gid}/messages", user="t60b")
+        quoted = [(m.get("reply") or {}).get("text", "")
+                  for m in hist_b["messages"] if m.get("reply")]
+        self.assertTrue(any("SECRET" in q for q in quoted), quoted)
+
+    def test_61_concurrent_delete_credits_storage_once(self):
+        # The tombstone must be claimed atomically: two concurrent deletes both
+        # passing the check credited the same bytes back twice, driving the
+        # quota counter below reality and letting a user exceed their quota.
+        import threading as _th
+        self.fresh("t61a", "t61b")
+        _, g = self.req("POST", "/api/groups", user="t61a",
+                        body={"name": "s61", "members": ["t61b"]})
+        gid = g["gid"]
+        keep = self.upload("t61a", b"K" * 300_000, name="keep.bin")
+        self.send_msg("t61a", "", gid=gid, files=[keep["file_id"]])
+        up = self.upload("t61a", b"Z" * 100_000, name="drop.bin")
+        mid = self.send_msg("t61a", "", gid=gid, files=[up["file_id"]])["id"]
+        self.poll_until("t61b", lambda e: e["id"] == mid)
+        barrier = _th.Barrier(2)
+
+        def racer():
+            barrier.wait()
+            self.req("POST", "/api/message/delete", user="t61a",
+                     body={"gid": gid, "mid": mid})
+        ts = [_th.Thread(target=racer) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        # the counter must still agree with the bytes actually on disk
+        self.assertEqual(self.store.storage_used("t61a"),
+                         self.store.recount_storage("t61a"))
+
+    def test_62_reactions_die_with_the_message(self):
+        self.fresh("t62a", "t62b")
+        sent = self.send_msg("t62a", "react then delete", to="t62b")
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t62b", lambda e: e["id"] == mid)
+        self.req("POST", "/api/message/react", user="t62b",
+                 body={"gid": gid, "mid": mid, "emoji": "👍"})
+        self.req("POST", "/api/message/delete", user="t62a",
+                 body={"gid": gid, "mid": mid})
+        _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t62b")
+        self.assertTrue(st["deleted"])
+        self.assertFalse(st.get("reactions"), st.get("reactions"))
+        # and you cannot react to a tombstone
+        status, _ = self.req("POST", "/api/message/react", user="t62b",
+                             body={"gid": gid, "mid": mid, "emoji": "❤️"})
+        self.assertEqual(status, 400)
+
     def test_58_typing_is_rate_limited(self):
         # One typing ping wakes EVERY other member's parked long-poll, so it is
         # cheap to send and costs fan-out to serve. Without a cap a member can

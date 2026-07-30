@@ -48,6 +48,12 @@ TYPING_CAP = 200         # max concurrent typing entries held in memory
 # the amplification a malicious member can create.
 TYPING_LIMIT = 60
 TYPING_WINDOW = 60
+TYPING_PER_USER = 20     # typing entries ONE user may hold (the global cap
+                         # alone lets one account crowd out everyone else)
+# Starring is cheap to ask for; GET /api/starred renders up to 200 messages,
+# each walking members/flags/attachments — an IO amplifier like search.
+STAR_LIMIT = 30
+STAR_WINDOW = 60
 PRESENCE_ONLINE_SECS = 60      # "online" = authenticated activity this recent
 LASTSEEN_PERSIST_SECS = 300    # write users/<u>/lastseen at most this often
 USER_STORAGE_QUOTA = 2 * 1024 * 1024 * 1024   # 2 GB of attachments per user

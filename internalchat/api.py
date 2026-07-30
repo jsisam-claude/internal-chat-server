@@ -21,7 +21,8 @@ from .config import (
     GROUP_OP_LIMIT, GROUP_OP_WINDOW, MAX_POLLS_PER_USER,
     SEARCH_LIMIT, SEARCH_WINDOW, SEARCH_SCAN_CAP, MAX_SEARCH_Q,
     MAX_REACTION, MAX_STARS, TYPING_TTL, TYPING_CAP,
-    TYPING_LIMIT, TYPING_WINDOW, PRESENCE_ONLINE_SECS, LASTSEEN_PERSIST_SECS)
+    TYPING_LIMIT, TYPING_WINDOW, TYPING_PER_USER, STAR_LIMIT, STAR_WINDOW,
+    PRESENCE_ONLINE_SECS, LASTSEEN_PERSIST_SECS)
 from .errors import ApiError
 from .util import (now_ms, sanitize_filename, msg_dirs_newest_first,
                    image_mime, audio_mime)
@@ -47,10 +48,11 @@ class Api:
                                           window=SEARCH_WINDOW)
         self.typing_limiter = RateLimiter(limit=TYPING_LIMIT,
                                           window=TYPING_WINDOW)
+        self.star_limiter = RateLimiter(limit=STAR_LIMIT, window=STAR_WINDOW)
         self.limiters = [self.login_limiter, self.login_ip_limiter,
                          self.send_limiter, self.upload_limiter,
                          self.group_limiter, self.search_limiter,
-                         self.typing_limiter]
+                         self.typing_limiter, self.star_limiter]
         # per-INSTANCE (not class) so two servers in one process don't share
         # a global parked-poll counter
         self._poll_lock = threading.Lock()
@@ -138,7 +140,11 @@ class Api:
             now = time.time()
             for k in [k for k, exp in self._typing.items() if exp <= now]:
                 del self._typing[k]
-            if len(self._typing) < TYPING_CAP:
+            # cap globally AND per user: without the per-user bound one
+            # account in many groups fills the table and silently suppresses
+            # everyone else's typing indicators
+            mine = sum(1 for (_g, _u) in self._typing if _u == user)
+            if len(self._typing) < TYPING_CAP and mine < TYPING_PER_USER:
                 self._typing[(gid, user)] = now + TYPING_TTL
         for u in self.store.members(gid):
             if u != user:
@@ -254,7 +260,13 @@ class Api:
         if not self.store.is_member(gid, user):
             link.unlink(missing_ok=True)
             raise ApiError(403, "not a member")
-        return self.render_msg(mdir)
+        # the router fans out on the CURRENT roster, so a member added between
+        # spool and route can receive an entry for a message predating their
+        # join; apply the same gate every other read path uses
+        if int(mdir.name[:13]) < self.store.joined_at(gid, user):
+            link.unlink(missing_ok=True)
+            raise ApiError(404, "message gone")
+        return self.render_msg(mdir, user)
 
     def _stamp(self, mdir: Path, user: str, kind: str) -> bool:
         """One code path for both flags: create the marker and queue the
@@ -382,6 +394,11 @@ class Api:
         actor — their other devices need it too) and wake them. Receivers
         refetch the message state; the entry itself carries no data."""
         for u in self.store.members(gid):
+            # a member who joined AFTER this message can't read it, so an event
+            # would only leak its existence and wedge an unresolvable entry in
+            # their queue
+            if int(mid[:13]) < self.store.joined_at(gid, u):
+                continue
             self.store.queue_add(u, f"{mid}~{kind}~{actor}", mdir)
             self.notifier.notify(u)
 
@@ -398,6 +415,8 @@ class Api:
         mdir = self._visible_mdir(user, gid, mid)
         if (mdir / "system").exists():
             raise ApiError(400, "cannot react to a system message")
+        if (mdir / "deleted").exists():
+            raise ApiError(400, "cannot react to a deleted message")
         self.send_limiter.check(user)   # reactions fan out like messages
         rdir = mdir / "reactions"
         rdir.mkdir(exist_ok=True)
@@ -433,13 +452,22 @@ class Api:
             raise ApiError(403, "not your message")
         if (mdir / "system").exists():
             raise ApiError(400, "cannot delete a system message")
-        if (mdir / "deleted").exists():
-            return {"ok": True}   # idempotent
+        # Claim the tombstone ATOMICALLY before doing any work. Previously the
+        # check and the write bracketed the whole rmtree, so two concurrent
+        # deletes both credited the same bytes back — driving the quota counter
+        # below reality and letting a user exceed their storage quota.
+        try:
+            (mdir / "deleted").touch(exist_ok=False)
+        except FileExistsError:
+            return {"ok": True}   # idempotent: another delete already won
+        except OSError:
+            raise ApiError(503, "delete failed, please retry")
         self.send_limiter.check(user)
         # tombstone: blank the text, drop the attachment bytes (crediting the
         # sender's storage back), and mark. The dir itself stays so queue
         # entries, replies, and history render a coherent "deleted" stub.
         freed = 0
+        shutil.rmtree(mdir / "reactions", ignore_errors=True)  # no orphan chips
         adir = mdir / "attachments"
         if adir.is_dir():
             for metaf in adir.glob("*.meta"):
@@ -449,6 +477,7 @@ class Api:
                     pass
             shutil.rmtree(adir, ignore_errors=True)
         self.store.write_atomic(mdir / "message.txt", b"")
+        # fill in the claim marker's stamp (it already exists from the claim)
         self.store.write_atomic(mdir / "deleted",
                                 str(self.store.next_ts()).encode())
         if freed:
@@ -525,7 +554,11 @@ class Api:
         return blob, meta
 
     # ---- reading -----------------------------------------------------------
-    def render_msg(self, mdir: Path) -> dict:
+    def render_msg(self, mdir: Path, user: str | None = None) -> dict:
+        """`user` is the READER. It gates the quoted reply stub: send() checks
+        reply_to against the SENDER's join time, but the stub is resolved at
+        read time, so without this a reply quotes pre-join content straight
+        into a newly-added member's history."""
         mid = mdir.name
         atts = []
         adir = mdir / "attachments"
@@ -574,10 +607,10 @@ class Api:
         if (mdir / "deleted").is_file():
             # belt and braces: a deleted message renders empty even if the
             # truncate raced or a stale attachment meta survived
-            out.update(deleted=True, text="", attachments=[])
+            out.update(deleted=True, text="", attachments=[], reactions={})
         rt = mdir / "reply_to"
         if rt.is_file():
-            out["reply"] = self._resolve_reply(gid, rt)
+            out["reply"] = self._resolve_reply(gid, rt, user)
         if (mdir / "system").is_file():
             try:
                 out["system"] = json.loads((mdir / "system").read_text())
@@ -585,7 +618,8 @@ class Api:
                 out["system"] = {}
         return out
 
-    def _resolve_reply(self, gid: str, rt: Path) -> dict:
+    def _resolve_reply(self, gid: str, rt: Path,
+                       user: str | None = None) -> dict:
         """Quoted-message stub, resolved fresh at read time so it tracks the
         target's current state (edits show, a deleted target shows as such)."""
         try:
@@ -594,6 +628,10 @@ class Api:
             return {"gone": True}
         if not MID_RE.match(tid):        # corrupt marker: never build a path
             return {"gone": True}
+        # the reader must be able to see the QUOTED message too, or a reply
+        # becomes a channel for leaking pre-join history 160 chars at a time
+        if user is not None and int(tid[:13]) < self.store.joined_at(gid, user):
+            return {"id": tid, "gone": True}
         tdir = self.store.msg_dir(gid, tid)
         try:
             if (tdir / "deleted").is_file():
@@ -625,7 +663,7 @@ class Api:
         flags-only response, under the same authorization."""
         if not (GID_RE.match(gid) and MID_RE.match(mid)):
             raise ApiError(400, "bad ids")
-        return self.render_msg(self._visible_mdir(user, gid, mid))
+        return self.render_msg(self._visible_mdir(user, gid, mid), user)
 
     def history(self, user: str, gid: str, before: str | None, limit: int) -> dict:
         if not GID_RE.match(gid):
@@ -642,7 +680,7 @@ class Api:
                 break  # newest-first: everything after this predates the join
             if before and mdir.name >= before:
                 continue
-            out.append(self.render_msg(mdir))
+            out.append(self.render_msg(mdir, user))
             if len(out) >= limit:
                 break
         return {"messages": out}
@@ -656,6 +694,13 @@ class Api:
     def star(self, user: str, body: dict) -> dict:
         gid, mid = body.get("gid", ""), body.get("mid", "")
         on = bool(body.get("on", True))
+        # Validate BEFORE building any path: a gid starting with '/' would make
+        # the marker Path absolute. Both branches happened to validate before
+        # touching the disk, but only by ordering — pin it here instead.
+        if not (isinstance(gid, str) and GID_RE.match(gid)
+                and isinstance(mid, str) and MID_RE.match(mid)):
+            raise ApiError(400, "bad ids")
+        self.star_limiter.check(user)
         sdir = self._starred_dir(user)
         marker = sdir / f"{gid}~{mid}"   # '~' can't appear in a gid or mid
         if on:
@@ -664,9 +709,6 @@ class Api:
                 raise ApiError(429, "too many starred messages")
             marker.touch()
         else:
-            if not (isinstance(gid, str) and GID_RE.match(gid)
-                    and isinstance(mid, str) and MID_RE.match(mid)):
-                raise ApiError(400, "bad ids")
             marker.unlink(missing_ok=True)
         return {"ok": True, "starred": on}
 
@@ -674,6 +716,9 @@ class Api:
         """The user's starred messages, newest first. Markers whose message is
         gone (archived, deleted group, we left) are pruned as we encounter
         them — the list is self-healing, like the queue."""
+        # rendering up to 200 messages walks members/flags/attachments for each,
+        # so this is an IO amplifier and needs the same cap as search
+        self.star_limiter.check(user)
         out = []
         for marker in sorted(self._starred_dir(user).iterdir(),
                              key=lambda p: p.name.split("~", 1)[-1],
@@ -682,11 +727,16 @@ class Api:
             if not (GID_RE.match(gid) and MID_RE.match(mid)):
                 continue
             mdir = self.store.msg_dir(gid, mid)
+            # Same gate as _visible_mdir: membership AND join time. A star
+            # survives leaving the group, so without the join check a member
+            # could star everything, leave, and harvest edits made while they
+            # were away after rejoining.
             if (not self.store.is_member(gid, user) or not mdir.is_dir()
+                    or int(mid[:13]) < self.store.joined_at(gid, user)
                     or (mdir / "deleted").is_file()):
                 marker.unlink(missing_ok=True)
                 continue
-            out.append(self.render_msg(mdir))
+            out.append(self.render_msg(mdir, user))
             if len(out) >= 200:
                 break
         return {"messages": out}
@@ -792,7 +842,10 @@ class Api:
                     "text": text[:80],
                     "attachments": len(list((mdir / "attachments").glob("*.meta")))}
             if (mdir / "deleted").is_file():
+                # belt and braces, exactly like render_msg: never show text for
+                # a message every other path renders empty
                 last["deleted"] = True
+                last["text"] = ""
             return last
         return None
 
