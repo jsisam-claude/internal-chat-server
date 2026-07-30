@@ -500,11 +500,6 @@ class Api:
             out["audio"] = amime
         return out
 
-    def _add_storage(self, udir: Path, delta: int) -> None:
-        with self._quota_lock:
-            new = max(0, self._storage_used(udir) + delta)
-            self.store.write_atomic(udir / "storage_used", str(new).encode())
-
     def attachment(self, user: str, gid: str, mid: str, n: str):
         if not (GID_RE.match(gid) and MID_RE.match(mid) and n.isdigit()
                 and 1 <= int(n) <= MAX_ATTACHMENTS):

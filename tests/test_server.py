@@ -1178,6 +1178,23 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(r.headers["Content-Type"], "application/octet-stream")
         self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
 
+    def test_57_storage_counter_self_heals(self):
+        # The running counter is a CACHE, not a ledger: the janitor recomputes
+        # it from the files, so drift (a missed credit-back, a crash, an admin
+        # deleting files by hand) can't permanently inflate a user's usage and
+        # lock them out of uploading.
+        self.fresh("t57a", "t57b")
+        up = self.upload("t57a", b"Z" * 5000, name="blob.bin")
+        self.send_msg("t57a", "keep", to="t57b", files=[up["file_id"]])
+        real = self.store.recount_storage("t57a")
+        self.assertEqual(real, 5000)
+        # simulate drift: pretend a credit-back was missed entirely
+        self.store.write_atomic(
+            self.store.user_dir("t57a") / "storage_used", b"999999999")
+        self.assertEqual(self.store.storage_used("t57a"), 999999999)
+        chatserver.Janitor(self.store, interval=3600).clean()   # one sweep
+        self.assertEqual(self.store.storage_used("t57a"), 5000)
+
     def test_56_edit_delete_guards(self):
         self.fresh("t56a", "t56b")
         sent = self.send_msg("t56a", "guard me", to="t56b")

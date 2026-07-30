@@ -82,15 +82,54 @@ class Store:
         os.replace(tmp, path)
 
     # ---- per-user storage accounting -------------------------------------
-    # A running byte total per user. It must be TWO-WAY (credited back when
-    # bytes are deleted) or the quota becomes a permanent lifetime cap that
-    # eventually locks everyone out. Lives here so the janitor and router can
-    # credit back on prune/bounce, not just the upload path.
+    # A running byte total per user, kept as a fast counter so an upload can
+    # check the quota without walking the tree. The counter is a CACHE, not a
+    # ledger: the janitor periodically recomputes it from the files themselves
+    # (recount_storage), so a missed credit-back can only ever cost one janitor
+    # interval instead of permanently inflating a user's usage until they are
+    # locked out. That makes the immediate credit-backs an optimization rather
+    # than a correctness requirement every future code path must remember.
     def storage_used(self, user: str) -> int:
         try:
             return int((self.user_dir(user) / "storage_used").read_text())
         except (OSError, ValueError):
             return 0
+
+    def recount_storage(self, user: str) -> int:
+        """Authoritative recount: staged uploads + every attachment this user
+        sent that still exists. Walks the same folders everything else does."""
+        total = 0
+        staged = self.user_dir(user) / "staged"
+        try:
+            for p in staged.iterdir():
+                if p.name.endswith(".meta"):
+                    continue
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+        except FileNotFoundError:
+            pass
+        try:
+            groups = list((self.root / "groups").iterdir())
+        except FileNotFoundError:
+            groups = []
+        for gdir in groups:
+            if not (gdir / "members" / user).exists():
+                continue      # only groups the user is still in can hold theirs
+            for mdir in msg_dirs_newest_first(gdir):
+                try:
+                    if (mdir / "from").read_text().strip() != user:
+                        continue
+                    for blob in (mdir / "attachments").iterdir():
+                        if not blob.name.endswith(".meta"):
+                            total += blob.stat().st_size
+                except OSError:
+                    continue
+        with self._quota_lock:
+            self.write_atomic(self.user_dir(user) / "storage_used",
+                              str(total).encode())
+        return total
 
     def add_storage(self, user: str, delta: int) -> None:
         with self._quota_lock:
