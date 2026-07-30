@@ -1178,6 +1178,20 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(r.headers["Content-Type"], "application/octet-stream")
         self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
 
+    def test_58_typing_is_rate_limited(self):
+        # One typing ping wakes EVERY other member's parked long-poll, so it is
+        # cheap to send and costs fan-out to serve. Without a cap a member can
+        # spin every other member's client (and a server thread each) for free.
+        self.fresh("t58a", "t58b")
+        gid = self.send_msg("t58a", "hi", to="t58b")["gid"]
+        seen = set()
+        for _ in range(200):
+            st, _ = self.req("POST", "/api/typing", user="t58a", body={"gid": gid})
+            seen.add(st)
+            if st == 429:
+                break
+        self.assertIn(429, seen, "typing must be rate limited")
+
     def test_57_storage_counter_self_heals(self):
         # The running counter is a CACHE, not a ledger: the janitor recomputes
         # it from the files, so drift (a missed credit-back, a crash, an admin
@@ -1199,6 +1213,10 @@ class ChatServerTest(unittest.TestCase):
         self.fresh("t56a", "t56b")
         sent = self.send_msg("t56a", "guard me", to="t56b")
         mid, gid = sent["id"], sent["gid"]
+        # wait for the router to move it into the group folder — until then it
+        # legitimately 404s (it isn't in the group yet), which would mask the
+        # 403 this test is actually about
+        self.poll_until("t56b", lambda e: e["id"] == mid)
         # cannot edit a deleted message; cannot delete someone else's
         status, _ = self.req("POST", "/api/message/delete", user="t56b",
                              body={"gid": gid, "mid": mid})

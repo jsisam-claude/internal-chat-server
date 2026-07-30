@@ -42,6 +42,12 @@ MAX_REACTION = 16        # max codepoints in a reaction (a grapheme, not text)
 MAX_STARS = 1000         # starred-message markers per user
 TYPING_TTL = 6.0         # seconds a typing signal stays live (client re-pings)
 TYPING_CAP = 200         # max concurrent typing entries held in memory
+# One typing call wakes every other group member's parked poll, so it is cheap
+# to send and expensive to serve (fan-out = group size). Clients re-ping every
+# 3s while typing (~20/min), so 60/min is generous for a human and still caps
+# the amplification a malicious member can create.
+TYPING_LIMIT = 60
+TYPING_WINDOW = 60
 PRESENCE_ONLINE_SECS = 60      # "online" = authenticated activity this recent
 LASTSEEN_PERSIST_SECS = 300    # write users/<u>/lastseen at most this often
 USER_STORAGE_QUOTA = 2 * 1024 * 1024 * 1024   # 2 GB of attachments per user

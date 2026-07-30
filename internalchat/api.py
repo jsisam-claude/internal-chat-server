@@ -21,7 +21,7 @@ from .config import (
     GROUP_OP_LIMIT, GROUP_OP_WINDOW, MAX_POLLS_PER_USER,
     SEARCH_LIMIT, SEARCH_WINDOW, SEARCH_SCAN_CAP, MAX_SEARCH_Q,
     MAX_REACTION, MAX_STARS, TYPING_TTL, TYPING_CAP,
-    PRESENCE_ONLINE_SECS, LASTSEEN_PERSIST_SECS)
+    TYPING_LIMIT, TYPING_WINDOW, PRESENCE_ONLINE_SECS, LASTSEEN_PERSIST_SECS)
 from .errors import ApiError
 from .util import (now_ms, sanitize_filename, msg_dirs_newest_first,
                    image_mime, audio_mime)
@@ -45,9 +45,12 @@ class Api:
                                          window=GROUP_OP_WINDOW)
         self.search_limiter = RateLimiter(limit=SEARCH_LIMIT,
                                           window=SEARCH_WINDOW)
+        self.typing_limiter = RateLimiter(limit=TYPING_LIMIT,
+                                          window=TYPING_WINDOW)
         self.limiters = [self.login_limiter, self.login_ip_limiter,
                          self.send_limiter, self.upload_limiter,
-                         self.group_limiter, self.search_limiter]
+                         self.group_limiter, self.search_limiter,
+                         self.typing_limiter]
         # per-INSTANCE (not class) so two servers in one process don't share
         # a global parked-poll counter
         self._poll_lock = threading.Lock()
@@ -126,6 +129,11 @@ class Api:
             raise ApiError(400, "bad group id")
         if not self.store.is_member(gid, user):
             raise ApiError(403, "not a member")
+        # A typing ping is one cheap request that wakes EVERY other member's
+        # parked long-poll, so it amplifies by group size — cap it like any
+        # other fan-out. Clients treat this as fire-and-forget, so a 429 just
+        # skips one indicator refresh.
+        self.typing_limiter.check(user)
         with self._typing_lock:
             now = time.time()
             for k in [k for k, exp in self._typing.items() if exp <= now]:
