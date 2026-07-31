@@ -1201,6 +1201,16 @@ class ChatServerTest(unittest.TestCase):
         for brand in (b"isom", b"mp42", b"avc1", b"dash", b"M4V "):
             self.assertEqual(av_mime(self._bmff(brand)), ("video", "video/mp4"),
                              brand)
+        # ISO-BMFF still images (HEIC/AVIF) share the box format but are NOT
+        # playable containers: they must not become a video that shows nothing
+        for brand in (b"heic", b"avif", b"mif1", b"msf1"):
+            self.assertIsNone(av_mime(self._bmff(brand)), brand)
+            # and the hint must not be able to turn one into audio either
+            self.assertIsNone(av_mime(self._bmff(brand), audio_hint=True), brand)
+        # brands whose real type isn't video/mp4 are declared correctly, since
+        # nosniff pins whatever we send
+        self.assertEqual(av_mime(self._bmff(b"qt  ")), ("video", "video/quicktime"))
+        self.assertEqual(av_mime(self._bmff(b"3gp4")), ("video", "video/3gpp"))
         # webm/matroska is undecidable without parsing -> defaults to VIDEO,
         # because a <video> element plays audio-only fine while an <audio>
         # element cannot show a video at all

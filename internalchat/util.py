@@ -60,6 +60,17 @@ def image_mime(head: bytes) -> str | None:
 # ISO-BMFF major brands that are audio-ONLY (iTunes audio). Every other brand
 # in the family (isom/iso2/mp41/mp42/avc1/dash/M4V …) may carry a video track.
 AUDIO_BRANDS = (b"M4A ", b"M4B ", b"M4P ")
+# ISO-BMFF brands that are STILL IMAGES, not playable containers: HEIC/AVIF
+# reuse the same box format. Without this an iPhone's .heic photo would be
+# classified video and shown as a black box that never decodes. We do not
+# render them inline either (no allowlisted decoder), so they stay downloads.
+STILL_BRANDS = (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
+                b"avif", b"avis")
+# Brands whose real media type isn't video/mp4. `nosniff` pins whatever we
+# declare, so declaring the right one is what makes playback possible at all.
+BRAND_MIME = {b"qt  ": "video/quicktime",
+              b"3gp4": "video/3gpp", b"3gp5": "video/3gpp",
+              b"3gp6": "video/3gpp", b"3g2a": "video/3gpp2"}
 
 
 def av_mime(head: bytes, audio_hint: bool = False) -> tuple[str, str] | None:
@@ -97,9 +108,12 @@ def av_mime(head: bytes, audio_hint: bool = False) -> tuple[str, str] | None:
     if head.startswith(b"\x1a\x45\xdf\xa3"):      # EBML: webm / matroska
         return ("audio", "audio/webm") if audio_hint else ("video", "video/webm")
     if len(head) >= 12 and head[4:8] == b"ftyp":  # ISO-BMFF: mp4 / m4a / mov
-        if head[8:12] in AUDIO_BRANDS or audio_hint:
+        brand = head[8:12]
+        if brand in STILL_BRANDS:
+            return None                    # a picture, not a playable container
+        if brand in AUDIO_BRANDS or audio_hint:
             return ("audio", "audio/mp4")
-        return ("video", "video/mp4")
+        return ("video", BRAND_MIME.get(brand, "video/mp4"))
     return None
 
 
