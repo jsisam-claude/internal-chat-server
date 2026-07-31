@@ -20,7 +20,7 @@ from .config import (
     LOGIN_WINDOW, LOGIN_USER_LIMIT, LOGIN_IP_LIMIT, USER_STORAGE_QUOTA,
     GROUP_OP_LIMIT, GROUP_OP_WINDOW, MAX_POLLS_PER_USER,
     SEARCH_LIMIT, SEARCH_WINDOW, SEARCH_SCAN_CAP, MAX_SEARCH_Q,
-    MAX_REACTION, MAX_STARS, TYPING_TTL, TYPING_CAP,
+    MAX_REACTION, MAX_STARS, TYPING_TTL, TYPING_CAP, QUEUE_PAGE,
     TYPING_LIMIT, TYPING_WINDOW, TYPING_PER_USER, STAR_LIMIT, STAR_WINDOW,
     PRESENCE_ONLINE_SECS, LASTSEEN_PERSIST_SECS)
 from .errors import ApiError
@@ -218,6 +218,8 @@ class Api:
     def _queue_items(self, user: str) -> list[dict]:
         out = []
         for link in sorted(self.store.queue_dir(user).iterdir()):
+            if len(out) >= QUEUE_PAGE:
+                break      # drain a backlog in pages; the client re-polls
             m = ENTRY_RE.match(link.name)
             if not m or not link.is_symlink():
                 continue

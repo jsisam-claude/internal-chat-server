@@ -1280,6 +1280,49 @@ class ChatServerTest(unittest.TestCase):
         self.assertNotIn("audio", up3)
         self.assertNotIn("video", up3)
 
+    def test_66_queue_is_paged(self):
+        # A user offline while a group ran hot can accumulate thousands of
+        # entries; one poll must return a bounded page (and every entry costs
+        # a realpath+lstat, so this is work as well as bytes).
+        from internalchat.config import QUEUE_PAGE
+        self.fresh("t66a", "t66b")
+        gid = self.send_msg("t66a", "seed", to="t66b")["gid"]
+        qdir = self.store.queue_dir("t66b")
+        target = self.store.msg_dir(gid, self.send_msg("t66a", "x", gid=gid)["id"])
+        import time as _time
+        for _ in range(60):          # wait for the router
+            if target.is_dir():
+                break
+            _time.sleep(0.05)
+        # fabricate a large backlog of flag events pointing at a real message
+        for i in range(QUEUE_PAGE + 50):
+            self.store.queue_add("t66b", f"{target.name}~d~u{i:04d}", target)
+        q = self.poll("t66b", wait=0)
+        self.assertLessEqual(len(q), QUEUE_PAGE, "poll must return one page")
+        self.assertGreater(len(q), 0)
+
+    def test_67_storage_recount_is_one_walk(self):
+        # The janitor used to re-walk the whole tree once PER USER for the same
+        # answer. One walk must produce every counter.
+        self.fresh("t67a", "t67b")
+        _, g = self.req("POST", "/api/groups", user="t67a",
+                        body={"name": "s67", "members": ["t67b"]})
+        gid = g["gid"]
+        up = self.upload("t67a", b"A" * 4000, name="a.bin")
+        self.send_msg("t67a", "", gid=gid, files=[up["file_id"]])
+        up2 = self.upload("t67b", b"B" * 1000, name="b.bin")
+        self.send_msg("t67b", "", gid=gid, files=[up2["file_id"]])
+        totals = self.store.recount_all_storage()
+        self.assertEqual(totals["t67a"], 4000)
+        self.assertEqual(totals["t67b"], 1000)
+        # and the counters on disk agree
+        self.assertEqual(self.store.storage_used("t67a"), 4000)
+        self.assertEqual(self.store.storage_used("t67b"), 1000)
+        # leaving a group does NOT un-count bytes that are still on disk
+        self.req("POST", f"/api/groups/{gid}/members", user="t67b",
+                 body={"remove": ["t67b"]})
+        self.assertEqual(self.store.recount_all_storage()["t67b"], 1000)
+
     # ---- security regressions (found in the v2 adversarial review) ----------
 
     def test_59_starred_enforces_join_gate(self):

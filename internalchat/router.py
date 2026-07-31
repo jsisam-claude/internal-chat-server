@@ -159,14 +159,6 @@ class Janitor(threading.Thread):
         prune(self.store.root / "tmp", 3600, dirs=True)
         for udir in (self.store.root / "users").iterdir():
             self._prune_staged(udir, now)   # credits storage back on expiry
-            # Re-derive the quota counter from the files themselves. The
-            # running counter is only a cache, so any drift (a missed
-            # credit-back, a crash mid-upload, an admin deleting files by
-            # hand) self-corrects here instead of accumulating forever.
-            try:
-                self.store.recount_storage(udir.name)
-            except OSError:
-                pass
             # empty nonce files are aborted send-claims; reclaim them fast
             # (1h) so a crashed claim doesn't wedge that nonce for 7 days
             self._prune_nonces(udir, now)
@@ -180,6 +172,16 @@ class Janitor(threading.Thread):
                         link.unlink(missing_ok=True)
             except FileNotFoundError:
                 pass
+        # Re-derive every quota counter from the files themselves, in ONE walk
+        # (per-user recounts repeated the same tree once per account). The
+        # counter is only a cache, so any drift — a missed credit-back, a crash
+        # mid-upload, an admin deleting files by hand — self-corrects here
+        # instead of accumulating forever. Runs AFTER staged pruning so expired
+        # uploads are already gone from the total.
+        try:
+            self.store.recount_all_storage()
+        except OSError:
+            pass
         if self.retain_days > 0:
             cutoff = (datetime.now(timezone.utc)
                       - timedelta(days=self.retain_days)).strftime("%Y-%m-%d")

@@ -95,41 +95,62 @@ class Store:
         except (OSError, ValueError):
             return 0
 
-    def recount_storage(self, user: str) -> int:
-        """Authoritative recount: staged uploads + every attachment this user
-        sent that still exists. Walks the same folders everything else does."""
-        total = 0
-        staged = self.user_dir(user) / "staged"
+    def recount_all_storage(self) -> dict:
+        """Re-derive EVERY user's usage in ONE walk of the tree, and write the
+        counters. Doing this per user re-walked the same messages once per
+        account — with 25 users that was literally 25x the work for the same
+        answer, every janitor sweep.
+
+        Bytes are attributed to whoever uploaded them, in whatever group they
+        still live in: leaving a group does not un-count attachments that are
+        still on disk (and still visible to the members who remain)."""
+        totals: dict = {}
+        users_root = self.root / "users"
         try:
-            for p in staged.iterdir():
-                if p.name.endswith(".meta"):
-                    continue
-                try:
-                    total += p.stat().st_size
-                except OSError:
-                    pass
+            names = [p.name for p in users_root.iterdir() if p.is_dir()]
         except FileNotFoundError:
-            pass
+            return {}
+        for user in names:
+            total = 0
+            try:
+                for p in (users_root / user / "staged").iterdir():
+                    if p.name.endswith(".meta"):
+                        continue
+                    try:
+                        total += p.stat().st_size
+                    except OSError:
+                        pass
+            except FileNotFoundError:
+                pass
+            totals[user] = total
         try:
             groups = list((self.root / "groups").iterdir())
         except FileNotFoundError:
             groups = []
         for gdir in groups:
-            if not (gdir / "members" / user).exists():
-                continue      # only groups the user is still in can hold theirs
             for mdir in msg_dirs_newest_first(gdir):
                 try:
-                    if (mdir / "from").read_text().strip() != user:
-                        continue
+                    sender = (mdir / "from").read_text().strip()
+                    if sender not in totals:
+                        continue          # unknown/removed account
                     for blob in (mdir / "attachments").iterdir():
                         if not blob.name.endswith(".meta"):
-                            total += blob.stat().st_size
+                            totals[sender] += blob.stat().st_size
                 except OSError:
                     continue
-        with self._quota_lock:
-            self.write_atomic(self.user_dir(user) / "storage_used",
-                              str(total).encode())
-        return total
+        for user, total in totals.items():
+            with self._quota_lock:
+                try:
+                    self.write_atomic(self.user_dir(user) / "storage_used",
+                                      str(total).encode())
+                except OSError:
+                    pass
+        return totals
+
+    def recount_storage(self, user: str) -> int:
+        """One user's authoritative total (admin/tests). Shares the single walk
+        rather than duplicating it — see recount_all_storage."""
+        return self.recount_all_storage().get(user, 0)
 
     def add_storage(self, user: str, delta: int) -> None:
         with self._quota_lock:
