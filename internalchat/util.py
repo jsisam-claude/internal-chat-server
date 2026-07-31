@@ -57,20 +57,49 @@ def image_mime(head: bytes) -> str | None:
     return None
 
 
-def audio_mime(head: bytes) -> str | None:
-    """Detect a SAFE-to-play-inline audio container from magic bytes only —
-    same rules as image_mime: constant-byte comparison, never parsing, never
-    the filename. Allowlist: webm/ogg (what MediaRecorder produces), mp4/m4a
-    (Safari's MediaRecorder), mp3. Anything else stays a download."""
-    if head.startswith(b"\x1a\x45\xdf\xa3"):          # EBML (webm)
-        return "audio/webm"
-    if head.startswith(b"OggS"):
-        return "audio/ogg"
-    if len(head) >= 8 and head[4:8] == b"ftyp":       # ISO-BMFF (mp4/m4a)
-        return "audio/mp4"
+# ISO-BMFF major brands that are audio-ONLY (iTunes audio). Every other brand
+# in the family (isom/iso2/mp41/mp42/avc1/dash/M4V …) may carry a video track.
+AUDIO_BRANDS = (b"M4A ", b"M4B ", b"M4P ")
+
+
+def av_mime(head: bytes, audio_hint: bool = False) -> tuple[str, str] | None:
+    """Detect a SAFE-to-play-inline audio/video CONTAINER from magic bytes.
+    Returns ("audio"|"video", mime), or None if it isn't playable media.
+
+    Same rules as image_mime: constant-offset byte comparison, never parsing,
+    never the filename. The wrinkle is that mp4 and webm are *containers* that
+    can each hold audio-only OR video, so a type alone doesn't say how to
+    present the file:
+
+    * ISO-BMFF is resolved by its `ftyp` MAJOR BRAND — a fixed-offset field, so
+      reading it is still just comparing constant bytes.
+    * WebM/Matroska is genuinely undecidable here: audio-vs-video lives in the
+      Tracks element, reachable only by walking EBML, which is parsing. It
+      therefore defaults to VIDEO, because the failure modes are asymmetric —
+      a <video> element plays an audio-only file fine (it just shows no
+      picture), while an <audio> element cannot show a video at all and looks
+      broken to the user.
+    * `audio_hint` lets a client that RECORDED a voice note say so. It is
+      PRESENTATION-ONLY: magic bytes remain the sole authority on whether a
+      file may render inline and which container is served, so the hint can
+      never make a non-media file inline-able, never changes the container, and
+      never yields a scriptable type. It only narrows an already-verified
+      ambiguous container from video to audio. Worst case, a user mislabels
+      their own message; there is no cross-user impact.
+    """
     if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF
                                    and (head[1] & 0xE0) == 0xE0):
-        return "audio/mpeg"
+        return ("audio", "audio/mpeg")            # mp3: never carries video
+    if head.startswith(b"OggS"):
+        # Ogg can technically carry Theora video, but that is effectively
+        # extinct; audio (vorbis/opus) is what clients produce.
+        return ("audio", "audio/ogg")
+    if head.startswith(b"\x1a\x45\xdf\xa3"):      # EBML: webm / matroska
+        return ("audio", "audio/webm") if audio_hint else ("video", "video/webm")
+    if len(head) >= 12 and head[4:8] == b"ftyp":  # ISO-BMFF: mp4 / m4a / mov
+        if head[8:12] in AUDIO_BRANDS or audio_hint:
+            return ("audio", "audio/mp4")
+        return ("video", "video/mp4")
     return None
 
 

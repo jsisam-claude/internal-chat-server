@@ -153,9 +153,13 @@ class Handler(BaseHTTPRequestHandler):
                     length = int(self.headers.get("Content-Length") or 0)
                 except ValueError:
                     length = 0
+                # X-Media-Kind is a PRESENTATION hint only (see av_mime): it
+                # can narrow an ambiguous A/V container to audio, and can never
+                # grant inline rendering or change the served container.
                 return self._send_json(api.upload(
                     user, self.rfile, length,
-                    self.headers.get("X-File-Name", "file")))
+                    self.headers.get("X-File-Name", "file"),
+                    self.headers.get("X-Media-Kind", "") == "audio"))
             if p == ["groups"]:
                 return self._send_json(api.create_group(self._user(),
                                                         self._json_body()))
@@ -203,7 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             blob, meta = api.attachment(self._user(), p[1], p[2], p[3])
             # inline rendering is allowed ONLY for media the server verified
             # by magic bytes at upload — the request cannot force it
-            media = meta.get("image") or meta.get("audio")
+            media = (meta.get("image") or meta.get("audio")
+                     or meta.get("video"))
             inline = q.get("inline", ["0"])[0] == "1" and bool(media)
             return self._send_blob(blob, meta["name"], meta["size"],
                                    ctype=media if inline

@@ -450,9 +450,12 @@ class ChatServerTest(unittest.TestCase):
             self.store.add_user(n, "pw-" + n, must_change=False)
             self.tokens[n] = self.login(n, "pw-" + n)["token"]
 
-    def upload(self, user, data, name="f.bin"):
+    def upload(self, user, data, name="f.bin", audio_hint=False):
+        headers = {"X-File-Name": name}
+        if audio_hint:          # what a client that RECORDED a voice note sends
+            headers["X-Media-Kind"] = "audio"
         status, up = self.req("POST", "/api/files", user=user, body=data,
-                              headers={"X-File-Name": name})
+                              headers=headers)
         self.assertEqual(status, 200, up)
         return up
 
@@ -1150,9 +1153,11 @@ class ChatServerTest(unittest.TestCase):
 
     def test_55_voice_note_audio_verified_inline(self):
         self.fresh("t55a", "t55b")
-        # a real-looking webm/EBML header → audio, inline allowed
+        # a real-looking webm/EBML header + the recorder's presentation hint
+        # → audio, inline allowed. (Without the hint webm is ambiguous and
+        # correctly defaults to video — see test_63.)
         up = self.upload("t55a", b"\x1a\x45\xdf\xa3" + b"\x00" * 64,
-                         name="voice.webm")
+                         name="voice.webm", audio_hint=True)
         self.assertEqual(up["audio"], "audio/webm")
         sent = self.send_msg("t55a", "", to="t55b", files=[up["file_id"]])
         mid, gid = sent["id"], sent["gid"]
@@ -1177,6 +1182,93 @@ class ChatServerTest(unittest.TestCase):
             user="t55b", raw=True)
         self.assertEqual(r.headers["Content-Type"], "application/octet-stream")
         self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
+
+    # ---- inline video / container disambiguation ---------------------------
+
+    # Fixed-offset headers. ISO-BMFF: [size][ftyp][major brand]. The brand is
+    # what distinguishes iTunes audio from everything that may carry video.
+    @staticmethod
+    def _bmff(brand: bytes) -> bytes:
+        return (b"\x00\x00\x00\x20" + b"ftyp" + brand
+                + b"\x00\x00\x02\x00" + brand * 2 + b"\x00" * 16)
+    EBML = b"\x1a\x45\xdf\xa3" + b"\x01\x00\x00\x00\x00\x00\x00\x23" + b"\x00" * 32
+
+    def test_63_container_kind_from_magic_bytes(self):
+        from internalchat.util import av_mime
+        # mp4 family: resolved by MAJOR BRAND, a fixed-offset field
+        self.assertEqual(av_mime(self._bmff(b"M4A ")), ("audio", "audio/mp4"))
+        self.assertEqual(av_mime(self._bmff(b"M4B ")), ("audio", "audio/mp4"))
+        for brand in (b"isom", b"mp42", b"avc1", b"dash", b"M4V "):
+            self.assertEqual(av_mime(self._bmff(brand)), ("video", "video/mp4"),
+                             brand)
+        # webm/matroska is undecidable without parsing -> defaults to VIDEO,
+        # because a <video> element plays audio-only fine while an <audio>
+        # element cannot show a video at all
+        self.assertEqual(av_mime(self.EBML), ("video", "video/webm"))
+        self.assertEqual(av_mime(self.EBML, audio_hint=True),
+                         ("audio", "audio/webm"))
+        # unambiguous audio is never affected by the hint
+        self.assertEqual(av_mime(b"ID3\x03\x00" + b"\x00" * 16),
+                         ("audio", "audio/mpeg"))
+        self.assertEqual(av_mime(b"OggS" + b"\x00" * 20), ("audio", "audio/ogg"))
+        # non-media stays non-media, hint or not
+        self.assertIsNone(av_mime(b"<html><script>x</script>"))
+        self.assertIsNone(av_mime(b"<html><script>x</script>", audio_hint=True))
+        self.assertIsNone(av_mime(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3", audio_hint=True))
+
+    def test_64_video_upload_and_inline_playback(self):
+        self.fresh("t64a", "t64b")
+        up = self.upload("t64a", self._bmff(b"isom") + b"\x00" * 512,
+                         name="clip.mp4")
+        self.assertEqual(up["video"], "video/mp4")
+        self.assertNotIn("audio", up)      # mutually exclusive
+        self.assertNotIn("image", up)
+        sent = self.send_msg("t64a", "", to="t64b", files=[up["file_id"]])
+        mid, gid = sent["id"], sent["gid"]
+        ev = self.poll_until("t64b", lambda e: e["id"] == mid)
+        _, msg = self.req("GET", f"/api/message/dequeue/{mid}", user="t64b")
+        self.assertEqual(msg["attachments"][0]["video"], "video/mp4")
+        # inline playback is allowed, under the same sandbox as images
+        r, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1?inline=1",
+                        user="t64b", raw=True)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.headers["Content-Type"], "video/mp4")
+        self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("sandbox", r.headers.get("Content-Security-Policy", ""))
+        self.assertIn("inline", r.headers.get("Content-Disposition", ""))
+        self.confirm("t64b", [ev["entry"]])
+
+    def test_65_media_hint_cannot_escalate(self):
+        # The hint is PRESENTATION-ONLY. It must never grant inline rendering
+        # to a non-media file, never change the container that gets served,
+        # and never produce a scriptable Content-Type.
+        self.fresh("t65a", "t65b")
+        # 1. an HTML file claiming to be audio stays a forced download
+        up = self.upload("t65a", b"<html><script>alert(1)</script></html>",
+                         name="evil.webm", audio_hint=True)
+        self.assertNotIn("audio", up)
+        self.assertNotIn("video", up)
+        self.assertNotIn("image", up)
+        sent = self.send_msg("t65a", "", to="t65b", files=[up["file_id"]])
+        ev = self.poll_until("t65b", lambda e: e["id"] == sent["id"])
+        r, _ = self.req(
+            "GET", f"/api/attachments/{sent['gid']}/{sent['id']}/1?inline=1",
+            user="t65b", raw=True)
+        self.assertEqual(r.headers["Content-Type"], "application/octet-stream")
+        self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
+        self.confirm("t65b", [ev["entry"]])
+        # 2. hinting audio on a real VIDEO only changes presentation; the
+        # served type stays within the same verified container family
+        up2 = self.upload("t65a", self.EBML + b"\x00" * 256,
+                          name="clip.webm", audio_hint=True)
+        self.assertEqual(up2["audio"], "audio/webm")
+        self.assertNotIn("video", up2)
+        # 3. an SVG is still never inline-able, hint or not
+        up3 = self.upload("t65a", b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                          name="x.svg", audio_hint=True)
+        self.assertNotIn("image", up3)
+        self.assertNotIn("audio", up3)
+        self.assertNotIn("video", up3)
 
     # ---- security regressions (found in the v2 adversarial review) ----------
 

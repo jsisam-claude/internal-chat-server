@@ -25,7 +25,7 @@ from .config import (
     PRESENCE_ONLINE_SECS, LASTSEEN_PERSIST_SECS)
 from .errors import ApiError
 from .util import (now_ms, sanitize_filename, msg_dirs_newest_first,
-                   image_mime, audio_mime)
+                   image_mime, av_mime)
 from .ratelimit import RateLimiter
 from .store import Store
 from .notifier import Notifier
@@ -485,7 +485,8 @@ class Api:
         self._fanout_event(gid, mid, "u", user, mdir)
         return {"ok": True}
 
-    def upload(self, user: str, rfile, length: int, rawname: str) -> dict:
+    def upload(self, user: str, rfile, length: int, rawname: str,
+               audio_hint: bool = False) -> dict:
         if length <= 0 or length > MAX_FILE:
             raise ApiError(413, f"file must be 1..{MAX_FILE} bytes")
         self.upload_limiter.check(user)   # cap upload rate per user
@@ -519,12 +520,14 @@ class Api:
             os.replace(tmp, staged / fid)
             meta = {"name": name, "size": length, "sha256": digest.hexdigest(),
                     "uploaded": now_ms()}
+            # Exactly one of image/audio/video may be set, always from the
+            # bytes themselves — this is the ONLY basis for inline rendering.
             mime = image_mime(head)
-            amime = None if mime else audio_mime(head)
+            av = None if mime else av_mime(head, audio_hint)
             if mime:
-                meta["image"] = mime  # server-verified: the ONLY basis for inline
-            if amime:
-                meta["audio"] = amime  # ditto, for inline <audio> playback
+                meta["image"] = mime
+            elif av:
+                meta[av[0]] = av[1]        # "audio" or "video" -> its mime
             self.store.write_atomic(staged / (fid + ".meta"),
                                     json.dumps(meta).encode())
         except Exception:
@@ -533,8 +536,8 @@ class Api:
         out = {"file_id": fid, "name": name, "sha256": meta["sha256"]}
         if mime:
             out["image"] = mime
-        if amime:
-            out["audio"] = amime
+        elif av:
+            out[av[0]] = av[1]
         return out
 
     def attachment(self, user: str, gid: str, mid: str, n: str):
@@ -573,6 +576,8 @@ class Api:
                         a["image"] = meta["image"]
                     if meta.get("audio"):   # server-verified at upload
                         a["audio"] = meta["audio"]
+                    if meta.get("video"):   # ditto — inline <video> playback
+                        a["video"] = meta["video"]
                     atts.append(a)
                 except (ValueError, KeyError):
                     continue
