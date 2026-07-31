@@ -121,8 +121,10 @@ class Api:
             return None
 
     def _online(self, user: str) -> bool:
-        return (time.time() - self._seen.get(user, 0) < PRESENCE_ONLINE_SECS
-                or self._polls.get(user, 0) > 0)
+        # A parked long-poll called touch_seen when it arrived and re-polls well
+        # inside PRESENCE_ONLINE_SECS, so consulting the poll counter told us
+        # nothing extra and coupled poll fairness to presence.
+        return time.time() - self._seen.get(user, 0) < PRESENCE_ONLINE_SECS
 
     # ---- typing (ephemeral, in-memory) --------------------------------------
     def typing(self, user: str, body: dict) -> dict:
@@ -238,7 +240,8 @@ class Api:
                 continue
             item = {"entry": link.name,
                     "kind": {"d": "delivered", "r": "read", "x": "failed",
-                             "a": "reaction", "u": "updated",
+                             "a": "updated",   # retired spelling of "u"
+                             "u": "updated",
                              None: "msg"}[kind],
                     "id": mid, "gid": gid, "at": at}
             if uid:
@@ -365,19 +368,27 @@ class Api:
         if reply_to is not None:
             if not (isinstance(reply_to, str) and MID_RE.match(reply_to)):
                 raise ApiError(400, "bad reply_to")
-            # the quoted message must exist in THIS group and be visible to
-            # the sender (post-join) — no quoting across groups or history
-            if (int(reply_to[:13]) < self.store.joined_at(gid, user)
-                    or not self.store.msg_dir(gid, reply_to).is_dir()):
+            # the quoted message must be one the sender can actually see —
+            # no quoting across groups or into pre-join history
+            if not self.can_see(user, gid, reply_to):
                 raise ApiError(404, "reply target not found")
         self.send_limiter.check(user)  # cap message/fan-out floods per user
         mid = self.store.spool_message(user, gid, text, files, nonce, reply_to)
         self.router.wake.set()
         return {"id": mid, "gid": gid}
 
+    def can_see(self, user: str, gid: str, mid: str) -> bool:
+        """THE visibility predicate, written once: a member of the group, a
+        message that exists, and not from before that member joined. Every read
+        path must go through this or _visible_mdir — two that spelled it out by
+        hand instead were later found leaking content (DESIGN.md §6)."""
+        return (self.store.is_member(gid, user)
+                and int(mid[:13]) >= self.store.joined_at(gid, user)
+                and self.store.msg_dir(gid, mid).is_dir())
+
     def _visible_mdir(self, user: str, gid: str, mid: str) -> Path:
-        """Resolve (gid, mid) to a message dir the user is allowed to touch:
-        member of the group, message exists, and not from before their join."""
+        """can_see, but raising the right error for each failure so callers
+        that want an exception don't have to re-derive it."""
         if not (isinstance(gid, str) and GID_RE.match(gid)
                 and isinstance(mid, str) and MID_RE.match(mid)):
             raise ApiError(400, "bad ids")
@@ -426,7 +437,7 @@ class Api:
             self.store.write_atomic(rdir / user, emoji.encode())
         else:
             (rdir / user).unlink(missing_ok=True)   # empty = remove reaction
-        self._fanout_event(gid, mid, "a", user, mdir)
+        self._fanout_event(gid, mid, "u", user, mdir)
         return {"ok": True, "reactions": self._reactions(mdir)}
 
     def edit_message(self, user: str, body: dict) -> dict:
@@ -454,17 +465,25 @@ class Api:
             raise ApiError(403, "not your message")
         if (mdir / "system").exists():
             raise ApiError(400, "cannot delete a system message")
-        # Claim the tombstone ATOMICALLY before doing any work. Previously the
-        # check and the write bracketed the whole rmtree, so two concurrent
-        # deletes both credited the same bytes back — driving the quota counter
-        # below reality and letting a user exceed their storage quota.
+        # EVERY limiter check happens before the first mutation. Checking after
+        # the tombstone claim meant a 429 left the message half-deleted — marked
+        # deleted, but with its text and attachments intact and no ~u~ event —
+        # and the retry then hit the "already claimed" path and reported
+        # success, so the content survived forever behind a delete that said it
+        # worked.
+        self.send_limiter.check(user)
+        # Claim the tombstone ATOMICALLY: two concurrent deletes must not both
+        # credit the same bytes back (that drove the quota counter below
+        # reality). The loser does NOT return early — it falls through to the
+        # cleanup, which is idempotent, so a delete interrupted after the claim
+        # is always completed by the next attempt.
+        first = True
         try:
             (mdir / "deleted").touch(exist_ok=False)
         except FileExistsError:
-            return {"ok": True}   # idempotent: another delete already won
+            first = False
         except OSError:
             raise ApiError(503, "delete failed, please retry")
-        self.send_limiter.check(user)
         # tombstone: blank the text, drop the attachment bytes (crediting the
         # sender's storage back), and mark. The dir itself stays so queue
         # entries, replies, and history render a coherent "deleted" stub.
@@ -482,7 +501,7 @@ class Api:
         # fill in the claim marker's stamp (it already exists from the claim)
         self.store.write_atomic(mdir / "deleted",
                                 str(self.store.next_ts()).encode())
-        if freed:
+        if freed and first:      # only the claim winner credits the bytes back
             self.store.add_storage(user, -freed)
         self._fanout_event(gid, mid, "u", user, mdir)
         return {"ok": True}
@@ -734,13 +753,10 @@ class Api:
             if not (GID_RE.match(gid) and MID_RE.match(mid)):
                 continue
             mdir = self.store.msg_dir(gid, mid)
-            # Same gate as _visible_mdir: membership AND join time. A star
-            # survives leaving the group, so without the join check a member
-            # could star everything, leave, and harvest edits made while they
-            # were away after rejoining.
-            if (not self.store.is_member(gid, user) or not mdir.is_dir()
-                    or int(mid[:13]) < self.store.joined_at(gid, user)
-                    or (mdir / "deleted").is_file()):
+            # A star survives leaving the group, so this needs the SAME gate as
+            # every other read path — without it a member could star everything,
+            # leave, and harvest edits made while they were away.
+            if not self.can_see(user, gid, mid) or (mdir / "deleted").is_file():
                 marker.unlink(missing_ok=True)
                 continue
             out.append(self.render_msg(mdir, user))

@@ -123,10 +123,12 @@ class Store:
             except FileNotFoundError:
                 pass
             totals[user] = total
-        try:
-            groups = list((self.root / "groups").iterdir())
-        except FileNotFoundError:
-            groups = []
+        groups = []
+        for root in (self.root / "groups", self.root / "archive"):
+            try:
+                groups.extend(root.iterdir())   # archived bytes are still bytes
+            except FileNotFoundError:
+                pass
         for gdir in groups:
             for mdir in msg_dirs_newest_first(gdir):
                 try:

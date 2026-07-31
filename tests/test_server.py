@@ -967,8 +967,10 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(
             (self.store.msg_dir(gid, mid) / "reactions" / "t46b").read_text(),
             "👍")
-        # alice gets a ~a~ reaction event and refetches state
-        ev = self.poll_until("t46a", lambda e: e["kind"] == "reaction"
+        # alice gets an update event and refetches state. Reactions, edits and
+        # deletes all use the ONE "message changed, refetch it" signal — the
+        # separate ~a~ spelling was retired (still parsed, never emitted).
+        ev = self.poll_until("t46a", lambda e: e["kind"] == "updated"
                              and e["id"] == mid)
         self.assertEqual(ev["user"], "t46b")
         _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t46a")

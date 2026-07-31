@@ -7,9 +7,11 @@ GID_RE = re.compile(r"^[gd]-[a-z0-9_.-]{1,72}$")
 MID_RE = re.compile(r"^\d{13}-[0-9a-f]{12}$")
 # queue entry: "<msg-id>" (a message), "<msg-id>~d~<user>" / "<msg-id>~r~<user>"
 # (delivered/read flag events for a message the queue's owner sent),
-# "<msg-id>~x~server" (routing failed; the owner's message bounced),
-# "<msg-id>~a~<user>" (reaction changed), or "<msg-id>~u~<user>" (message
-# edited/deleted) — the a/u events carry no payload; clients refetch state
+# "<msg-id>~x~server" (routing failed; the owner's message bounced), or
+# "<msg-id>~u~<user>" (the message changed — reaction, edit or delete; carries
+# no payload, the client refetches state).
+# `a` is the retired spelling of `u`: still PARSED so entries queued by an
+# older build drain cleanly, never emitted. Drop it a release from now.
 ENTRY_RE = re.compile(r"^(\d{13}-[0-9a-f]{12})(?:~([drxau])~([a-z0-9_.-]{1,32}))?$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
