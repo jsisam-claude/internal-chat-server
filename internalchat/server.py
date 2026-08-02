@@ -20,6 +20,22 @@ from .notifier import Notifier
 from .router import Router
 from .api import Api
 
+def _reject_surrogates(obj) -> None:
+    """Walk a parsed JSON value and raise 400 if any string holds a lone
+    surrogate (\\ud800-\\udfff). Such strings decode fine but crash on UTF-8
+    encode; bounded by MAX_JSON so the walk is cheap."""
+    if isinstance(obj, str):
+        if any("\ud800" <= c <= "\udfff" for c in obj):
+            raise ApiError(400, "bad json")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _reject_surrogates(k)
+            _reject_surrogates(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _reject_surrogates(v)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 75  # must exceed MAX_WAIT so long-polls aren't cut off
@@ -61,11 +77,17 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < length <= MAX_JSON:
             raise ApiError(400, "missing or oversized body")
         try:
+            # RecursionError: a deeply-nested "[[[[..." blows the parser's C
+            # recursion limit; without catching it a malformed body 500s.
             body = json.loads(self.rfile.read(length))
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             raise ApiError(400, "bad json")
         if not isinstance(body, dict):
             raise ApiError(400, "bad json")
+        # JSON permits "\ud800" (a lone surrogate) but UTF-8 cannot encode it,
+        # so any downstream `.encode()` (password hashing, message.txt, emoji,
+        # group names) would raise UnicodeEncodeError → 500. Reject at the door.
+        _reject_surrogates(body)
         return body
 
     def _user(self) -> str:
@@ -174,6 +196,8 @@ class Handler(BaseHTTPRequestHandler):
                 wait = float(q.get("wait", ["0"])[0])
             except ValueError:
                 wait = 0.0
+            if wait != wait:   # NaN: min(nan, MAX_WAIT) stays nan and the poll
+                wait = 0.0     # deadline never elapses, wedging a worker thread
             return self._send_json(api.list_queue(self._user(), wait))
         if len(p) == 3 and p[:2] == ["message", "dequeue"]:
             return self._send_json(api.peek(self._user(), p[2]))

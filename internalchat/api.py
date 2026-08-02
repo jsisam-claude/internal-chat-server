@@ -255,7 +255,13 @@ class Api:
         link = self.store.queue_dir(user) / entry
         if not link.is_symlink():
             raise ApiError(404, "not in your queue")
-        mdir = Path(os.path.realpath(link))
+        # the link can be unlinked concurrently (a second device confirming, or
+        # the janitor); realpath then raises FileNotFoundError — that just means
+        # the entry is gone, which is a 404, not a 500
+        try:
+            mdir = Path(os.path.realpath(link))
+        except FileNotFoundError:
+            raise ApiError(404, "message gone")
         gid = self.store.gid_of(mdir)
         if gid is None or not mdir.is_dir():
             raise ApiError(404, "message gone")
@@ -300,17 +306,26 @@ class Api:
             if not m:
                 raise ApiError(400, "bad queue entry")
             link = self.store.queue_dir(user) / name
-            if not link.is_symlink():
+            # A second device draining the SAME queue (or the janitor's
+            # dangling-link prune) can unlink this entry between our checks;
+            # os.path.realpath then raises FileNotFoundError. The entry is
+            # already gone, which is exactly the outcome we wanted — treat any
+            # such disappearance as done, never a 500 (same guard _queue_items
+            # uses).
+            try:
+                if not link.is_symlink():
+                    continue
+                if m.group(2) is None:  # a message entry, not a flag event
+                    mdir = Path(os.path.realpath(link))
+                    gid = self.store.gid_of(mdir)
+                    # only stamp delivered if the user is genuinely still a
+                    # member; a stale entry for a left group is just unlinked
+                    if gid and mdir.is_dir() and self.store.is_member(gid, user):
+                        self._stamp(mdir, user, "d")
+                link.unlink(missing_ok=True)
+                confirmed += 1
+            except FileNotFoundError:
                 continue
-            if m.group(2) is None:  # a message entry, not a flag event
-                mdir = Path(os.path.realpath(link))
-                gid = self.store.gid_of(mdir)
-                # only stamp delivered if the user is genuinely still a member;
-                # a stale entry for a left group is just unlinked
-                if gid and mdir.is_dir() and self.store.is_member(gid, user):
-                    self._stamp(mdir, user, "d")
-            link.unlink(missing_ok=True)
-            confirmed += 1
         return {"confirmed": confirmed}
 
     def viewed(self, user: str, body: dict) -> dict:
@@ -573,7 +588,10 @@ class Api:
         return out
 
     def attachment(self, user: str, gid: str, mid: str, n: str):
-        if not (GID_RE.match(gid) and MID_RE.match(mid) and n.isdigit()
+        # `str.isdigit()` is True for non-ASCII digits like "¹" (superscript
+        # one), but int() then raises ValueError → 500; pin it to ASCII 0-9.
+        if not (GID_RE.match(gid) and MID_RE.match(mid)
+                and n.isascii() and n.isdigit()
                 and 1 <= int(n) <= MAX_ATTACHMENTS):
             raise ApiError(400, "bad attachment path")
         if not self.store.is_member(gid, user):
@@ -581,6 +599,12 @@ class Api:
         if int(mid[:13]) < self.store.joined_at(gid, user):
             raise ApiError(404, "no such attachment")  # pre-join: invisible
         mdir = self.store.msg_dir(gid, mid)
+        # A deleted message's tombstone is authoritative (render_msg blanks its
+        # text). Attachment bytes are dropped right after the tombstone is
+        # claimed, but if that step was interrupted (crash/ENOSPC) the blobs can
+        # linger — never serve them, or "delete for everyone" leaks its content.
+        if (mdir / "deleted").is_file():
+            raise ApiError(404, "no such attachment")
         blob = mdir / "attachments" / str(int(n))
         metaf = mdir / "attachments" / f"{int(n)}.meta"
         if not (blob.is_file() and metaf.is_file()):
@@ -942,11 +966,15 @@ class Api:
             self.store.spool_system(u, gid, f"{u} left",
                                     {"event": "leave", "user": u})
             (md / u).unlink(missing_ok=True)
-            # leaving sweeps this group's entries out of the leaver's queue
+            # leaving sweeps this group's entries out of the leaver's queue;
+            # guard the realpath against a concurrent drain unlinking the entry
             for link in self.store.queue_dir(u).iterdir():
-                if (link.is_symlink()
-                        and self.store.gid_of(os.path.realpath(link)) == gid):
-                    link.unlink(missing_ok=True)
+                try:
+                    if (link.is_symlink()
+                            and self.store.gid_of(os.path.realpath(link)) == gid):
+                        link.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    continue
         self.router.wake.set()
         return {"members": self.store.members(gid)}
 

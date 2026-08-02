@@ -1521,6 +1521,75 @@ class ChatServerTest(unittest.TestCase):
                                    "emoji": "👍"})
         self.assertEqual(status, 400)
 
+    # ---- hardening regressions (found by the input/crash fuzzers) -----------
+
+    def test_70_lone_surrogate_body_is_rejected_not_500(self):
+        # JSON permits "\ud800" (a lone surrogate) but UTF-8 cannot encode it,
+        # so any endpoint that .encode()s the value used to 500. Every JSON body
+        # must reject it at the door with a 400.
+        self.fresh("t70a", "t70b")
+        surrogate = "\ud800"
+        # login password, send text, react emoji, edit text, group name
+        st, _ = self.req("POST", "/api/login",
+                         body={"user": "t70a", "password": surrogate})
+        self.assertEqual(st, 400)
+        st, _ = self.req("POST", "/api/messages", user="t70a",
+                         body={"to": "t70b", "text": surrogate,
+                               "nonce": "n-" + os.urandom(6).hex()})
+        self.assertEqual(st, 400)
+        st, _ = self.req("POST", "/api/groups", user="t70a",
+                         body={"name": surrogate, "members": ["t70b"]})
+        self.assertEqual(st, 400)
+
+    def test_71_deeply_nested_json_is_rejected_not_500(self):
+        # A "[[[[..." body blows json's C recursion limit; RecursionError must
+        # be caught and turned into a 400, not surface as a 500.
+        r, _ = self.req("POST", "/api/login", raw=True,
+                        body=b"[" * 100000,
+                        headers={"Content-Type": "application/json"})
+        self.assertEqual(r.status, 400)
+
+    def test_72_non_ascii_digit_attachment_index_is_400(self):
+        # str.isdigit() is True for "¹" (superscript one) but int("¹") raises
+        # ValueError → 500. The index must be pinned to ASCII 0-9. (Driven at
+        # the API layer: http.client can't put a non-ASCII byte in the request
+        # line, which is why only a raw-socket fuzzer surfaced this.)
+        from internalchat.errors import ApiError
+        self.fresh("t72a", "t72b")
+        gid = self.send_msg("t72a", "hi", to="t72b")["gid"]
+        mid = self.send_msg("t72a", "hi2", gid=gid)["id"]
+        with self.assertRaises(ApiError) as cm:
+            self.api.attachment("t72a", gid, mid, "¹")
+        self.assertEqual(cm.exception.status, 400)
+
+    def test_73_deleted_attachment_is_not_downloadable(self):
+        # "Delete for everyone" is a confidentiality promise: once a message is
+        # tombstoned its attachment bytes must never be served, even if a crash
+        # left the blobs on disk (attachment() consults the tombstone, not just
+        # blob.is_file()).
+        self.fresh("t73a", "t73b")
+        up = self.upload("t73a", b"secret-bytes" * 50, name="s.bin")
+        sent = self.send_msg("t73a", "", to="t73b", files=[up["file_id"]])
+        gid, mid = sent["gid"], sent["id"]
+        self.poll_until("t73b", lambda e: e["id"] == mid)  # wait for routing
+        # it downloads before deletion
+        r, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1",
+                        user="t73a", raw=True)
+        self.assertEqual(r.status, 200)
+        # simulate a crash mid-delete: tombstone claimed, blobs NOT yet removed
+        (self.store.msg_dir(gid, mid) / "deleted").touch()
+        r, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1",
+                        user="t73a", raw=True)
+        self.assertEqual(r.status, 404)
+
+    def test_74_nan_wait_does_not_wedge_the_poll(self):
+        # wait=nan used to leave the poll deadline as nan (never elapses),
+        # wedging a worker thread. It must return promptly like wait=0.
+        self.fresh("t74a")
+        st, resp = self.req("GET", "/api/messages?wait=nan", user="t74a")
+        self.assertEqual(st, 200)
+        self.assertIn("queue", resp)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

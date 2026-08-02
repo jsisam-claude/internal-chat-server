@@ -35,6 +35,30 @@ class Store:
             self._last_ms = int(self._hwm_path.read_text())
         except (OSError, ValueError):
             self._last_ms = 0
+        # Defence in depth: the hwm write is best-effort, so a lost/stale hwm
+        # plus a backward clock step could issue ids BELOW existing join stamps,
+        # silently hiding new messages from members behind the join-gate. Seed
+        # the floor from the durable join stamps (cheap: one file per membership)
+        # so the clock can never regress under them, hwm or no hwm.
+        self._last_ms = max(self._last_ms, self._max_join_stamp())
+
+    def _max_join_stamp(self) -> int:
+        floor = 0
+        groups = self.root / "groups"
+        try:
+            gdirs = list(groups.iterdir())
+        except OSError:
+            return floor
+        for gdir in gdirs:
+            try:
+                for mf in (gdir / "members").iterdir():
+                    try:
+                        floor = max(floor, int(mf.read_text().strip() or 0))
+                    except (OSError, ValueError):
+                        pass
+            except OSError:
+                pass
+        return floor
 
     def next_ts(self) -> int:
         """A strictly-increasing millisecond stamp on ONE clock — persisted and
@@ -177,13 +201,24 @@ class Store:
         d = self.user_dir(user)
         if d.exists():
             raise ApiError(409, "user exists")
-        for sub in ("sessions", "queue", "staged", "nonces", "starred"):
-            (d / sub).mkdir(parents=True)
         salt = secrets.token_bytes(16)
         h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, self.iters)
         auth = {"display": display or user, "salt": salt.hex(), "hash": h.hex(),
                 "iters": self.iters, "must_change": must_change, "created": now_ms()}
-        self.write_atomic(d / "auth.json", json.dumps(auth).encode())
+        # Build the whole user tree in tmp/ and rename it in atomically. A
+        # half-built tree (mkdirs done, auth.json not yet written) used to wedge
+        # the name forever: d.exists() true but user_exists() false, so retries
+        # 409'd and the account could never authenticate. Now a crash leaves
+        # only a tmp orphan (janitor-pruned) and the name stays reusable.
+        tmp = self.root / "tmp" / f"u-{user}-{secrets.token_hex(4)}"
+        for sub in ("sessions", "queue", "staged", "nonces", "starred"):
+            (tmp / sub).mkdir(parents=True)
+        (tmp / "auth.json").write_bytes(json.dumps(auth).encode())
+        try:
+            os.rename(tmp, d)   # atomic; fails if a racing create populated d
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ApiError(409, "user exists")
 
     def user_exists(self, user: str) -> bool:
         return bool(USER_RE.match(user)) and (self.user_dir(user) / "auth.json").is_file()
@@ -375,7 +410,17 @@ class Store:
         except Exception:
             nf.unlink(missing_ok=True)  # release the claim so a retry can work
             raise
-        self.write_atomic(nf, mid.encode())  # publish the mid last
+        try:
+            self.write_atomic(nf, mid.encode())  # publish the mid last
+        except OSError:
+            # The message is already durable in incoming/ and WILL deliver once;
+            # we just couldn't record the dedup mid. Releasing the empty claim
+            # beats leaving it: a lingering empty nonce 503s every retry for an
+            # hour (until the janitor prunes it) and then duplicates the send.
+            # The message is sent, so hand back its id. A client retry that
+            # races this narrow window could still duplicate — far rarer than
+            # the guaranteed wedge-then-duplicate it replaces.
+            nf.unlink(missing_ok=True)
         return mid
 
     def _await_nonce(self, nf: Path) -> str:
