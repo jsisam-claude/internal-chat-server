@@ -32,9 +32,19 @@ def cmd_serve(args) -> None:
         httpd.shutdown()
 
 
+def _password(args, prompt: str) -> str:
+    """One rule for both commands, and the SAME rule POST /api/password
+    enforces — the CLI used to accept a 1-character or even empty password,
+    which is a weaker account than the API would ever let a user create."""
+    pw = args.password if args.password is not None else getpass.getpass(prompt)
+    if not 8 <= len(pw) <= 128:
+        raise ApiError(400, "password must be 8..128 characters")
+    return pw
+
+
 def cmd_adduser(args) -> None:
     store = Store(args.data)
-    password = args.password or getpass.getpass(f"initial password for {args.user}: ")
+    password = _password(args, f"initial password for {args.user}: ")
     store.add_user(args.user, password, display=args.display,
                    must_change=not args.no_change)
     print(f"user {args.user!r} created (must change password on first login: "
@@ -45,7 +55,7 @@ def cmd_passwd(args) -> None:
     store = Store(args.data)
     if not store.user_exists(args.user):
         raise ApiError(404, "no such user")
-    password = args.password or getpass.getpass(f"new password for {args.user}: ")
+    password = _password(args, f"new password for {args.user}: ")
     store.set_password(args.user, password, must_change=not args.no_change)
     for s in (store.user_dir(args.user) / "sessions").iterdir():
         s.unlink(missing_ok=True)  # admin reset logs the user out everywhere
@@ -88,5 +98,8 @@ def main(argv=None) -> None:
         args.func(args)
     except ApiError as e:
         print(f"error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (EOFError, KeyboardInterrupt):
+        print("error: no password supplied", file=sys.stderr)
         sys.exit(1)
 

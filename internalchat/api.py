@@ -480,6 +480,22 @@ class Api:
         # reality). The loser does NOT return early — it falls through to the
         # cleanup, which is idempotent, so a delete interrupted after the claim
         # is always completed by the next attempt.
+        # Size the attachments BEFORE claiming. Reading is non-destructive, so
+        # both racers get the true total and only the winner credits it; doing
+        # it after the claim meant a concurrent delete could empty the directory
+        # first, which both raised FileNotFoundError out of glob() (a 500 telling
+        # the user the delete failed when it had succeeded) and made the winner
+        # credit back zero.
+        freed = 0
+        adir = mdir / "attachments"
+        try:
+            for metaf in adir.glob("*.meta"):
+                try:
+                    freed += json.loads(metaf.read_text()).get("size", 0)
+                except (OSError, ValueError):
+                    pass
+        except OSError:
+            pass          # already gone: nothing of ours left to credit
         first = True
         try:
             (mdir / "deleted").touch(exist_ok=False)
@@ -490,16 +506,8 @@ class Api:
         # tombstone: blank the text, drop the attachment bytes (crediting the
         # sender's storage back), and mark. The dir itself stays so queue
         # entries, replies, and history render a coherent "deleted" stub.
-        freed = 0
         shutil.rmtree(mdir / "reactions", ignore_errors=True)  # no orphan chips
-        adir = mdir / "attachments"
-        if adir.is_dir():
-            for metaf in adir.glob("*.meta"):
-                try:
-                    freed += json.loads(metaf.read_text()).get("size", 0)
-                except (OSError, ValueError):
-                    pass
-            shutil.rmtree(adir, ignore_errors=True)
+        shutil.rmtree(adir, ignore_errors=True)
         self.store.write_atomic(mdir / "message.txt", b"")
         # fill in the claim marker's stamp (it already exists from the claim)
         self.store.write_atomic(mdir / "deleted",

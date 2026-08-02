@@ -192,6 +192,10 @@ class Janitor(threading.Thread):
                 try:
                     if any((gdir / "members").iterdir()):
                         continue
+                except FileNotFoundError:
+                    pass          # no members/ at all is member-less too: the
+                                  # router can recreate a bare skeleton for a
+                                  # message that was mid-flight when we archived
                 except OSError:
                     continue
                 dst = self.store.root / "archive" / gdir.name

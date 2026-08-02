@@ -21,10 +21,18 @@ class RateLimiter:
         now = time.time()
         with self._lock:
             if key not in self._hits and len(self._hits) >= self.max_keys:
-                # table full: drop every key whose window has fully expired
+                # Table full: drop every key whose window has fully expired.
                 for k in [k for k, v in self._hits.items()
                           if not v or now - v[-1] >= self.window]:
                     del self._hits[k]
+                # If it is STILL full, every key is live. Admitting this one
+                # anyway broke the documented bound (the table grew without
+                # limit) AND made this whole-table scan run on every subsequent
+                # check, holding the lock that serializes every request through
+                # this limiter — measured at 385us/check by 16k keys. Refuse
+                # instead: under that much pressure the caller IS the flood.
+                if len(self._hits) >= self.max_keys:
+                    raise ApiError(429, "too many attempts, slow down")
             q = self._hits.setdefault(key, [])
             q[:] = [t for t in q if now - t < self.window]
             if len(q) >= self.limit:
