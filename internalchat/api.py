@@ -326,9 +326,12 @@ class Api:
         for mid in ids[:500]:
             if not (isinstance(mid, str) and MID_RE.match(mid)):
                 raise ApiError(400, "bad message id")
-            mdir = self.store.msg_dir(gid, mid)
-            if not mdir.is_dir():
+            # the SAME gate as every read path: without it a member added later
+            # could mark-read a message they can't see, and the sender would get
+            # a blue tick for someone who was never shown it
+            if not self.can_see(user, gid, mid):
                 continue
+            mdir = self.store.msg_dir(gid, mid)
             sender = (mdir / "from").read_text().strip()
             if sender == user or (mdir / "system").exists():
                 continue

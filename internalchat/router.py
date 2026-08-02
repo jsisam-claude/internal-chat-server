@@ -182,6 +182,28 @@ class Janitor(threading.Thread):
             self.store.recount_all_storage()
         except OSError:
             pass
+        # A group whose last member left is unreachable through every API path,
+        # yet it was still walked by list_groups and the storage recount on
+        # every call, forever. Park it in archive/ (non-destructive: the files
+        # are still there for an admin, and the quota recount still counts
+        # them) so it stops costing anything on the hot paths.
+        try:
+            for gdir in (self.store.root / "groups").iterdir():
+                try:
+                    if any((gdir / "members").iterdir()):
+                        continue
+                except OSError:
+                    continue
+                dst = self.store.root / "archive" / gdir.name
+                if dst.exists():
+                    dst = self.store.root / "archive" / f"{gdir.name}-{int(now)}"
+                try:
+                    shutil.move(str(gdir), str(dst))
+                    log(f"janitor: archived member-less group {gdir.name}")
+                except OSError:
+                    pass
+        except FileNotFoundError:
+            pass
         if self.retain_days > 0:
             cutoff = (datetime.now(timezone.utc)
                       - timedelta(days=self.retain_days)).strftime("%Y-%m-%d")

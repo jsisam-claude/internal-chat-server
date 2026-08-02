@@ -1325,6 +1325,45 @@ class ChatServerTest(unittest.TestCase):
                  body={"remove": ["t67b"]})
         self.assertEqual(self.store.recount_all_storage()["t67b"], 1000)
 
+    def test_68_viewed_respects_the_join_gate(self):
+        # Read receipts must not lie. Without the gate a member added later
+        # could mark-read a message they are never shown, and the SENDER got a
+        # blue tick claiming they had read it.
+        self.fresh("t68a", "t68b", "t68c")
+        _, g = self.req("POST", "/api/groups", user="t68a",
+                        body={"name": "s68", "members": ["t68b"]})
+        gid = g["gid"]
+        pre = self.send_msg("t68a", "pre-join", gid=gid)["id"]
+        self.poll_until("t68b", lambda e: e["id"] == pre)
+        self.req("POST", f"/api/groups/{gid}/members", user="t68a",
+                 body={"add": ["t68c"]})
+        st, r = self.req("POST", "/api/message/viewed", user="t68c",
+                         body={"gid": gid, "ids": [pre]})
+        self.assertEqual(st, 200)
+        self.assertEqual(r["marked"], 0, "must not mark an invisible message")
+        self.assertFalse((self.store.msg_dir(gid, pre) / "readby" / "t68c").exists())
+        # a member who CAN see it still works normally
+        st, r = self.req("POST", "/api/message/viewed", user="t68b",
+                         body={"gid": gid, "ids": [pre]})
+        self.assertEqual(r["marked"], 1)
+
+    def test_69_member_less_group_is_archived(self):
+        # Everyone can leave a group; the folder then stays unreachable but was
+        # still walked by list_groups and the storage recount forever.
+        self.fresh("t69a", "t69b")
+        _, g = self.req("POST", "/api/groups", user="t69a",
+                        body={"name": "ghost", "members": ["t69b"]})
+        gid = g["gid"]
+        self.send_msg("t69a", "orphan", gid=gid)
+        for u in ("t69a", "t69b"):
+            self.req("POST", f"/api/groups/{gid}/members", user=u,
+                     body={"remove": [u]})
+        self.assertEqual(self.store.members(gid), [])
+        chatserver.Janitor(self.store, interval=3600).clean()
+        self.assertFalse(self.store.group_dir(gid).exists())
+        # non-destructive: the data is parked, not deleted
+        self.assertTrue((self.store.root / "archive" / gid).is_dir())
+
     # ---- security regressions (found in the v2 adversarial review) ----------
 
     def test_59_starred_enforces_join_gate(self):
