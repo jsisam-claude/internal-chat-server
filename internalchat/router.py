@@ -198,9 +198,15 @@ class Janitor(threading.Thread):
                                   # message that was mid-flight when we archived
                 except OSError:
                     continue
+                # A fresh, non-existent name every time: shutil.move nests
+                # the source INTO an existing dir, which would hide the group's
+                # attachments from the recount. (archive/<gid> may already hold
+                # day folders parked by retain_days.)
                 dst = self.store.root / "archive" / gdir.name
-                if dst.exists():
-                    dst = self.store.root / "archive" / f"{gdir.name}-{int(now)}"
+                suffix = 0
+                while dst.exists():
+                    suffix += 1
+                    dst = self.store.root / "archive" / f"{gdir.name}-{int(now)}-{suffix}"
                 try:
                     shutil.move(str(gdir), str(dst))
                     log(f"janitor: archived member-less group {gdir.name}")
