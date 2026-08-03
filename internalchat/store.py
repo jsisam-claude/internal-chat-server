@@ -3,6 +3,7 @@ files, and symlinks. Every mutation is an atomic create/rename/unlink so
 readers never observe partial state. This module is the on-disk data model."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import json
@@ -36,13 +37,16 @@ class Store:
         except (OSError, ValueError):
             self._last_ms = 0
         # Defence in depth: the hwm write is best-effort, so a lost/stale hwm
-        # plus a backward clock step could issue ids BELOW existing join stamps,
-        # silently hiding new messages from members behind the join-gate. Seed
-        # the floor from the durable join stamps (cheap: one file per membership)
-        # so the clock can never regress under them, hwm or no hwm.
-        self._last_ms = max(self._last_ms, self._max_join_stamp())
+        # plus a backward clock step could issue ids BELOW existing on-disk
+        # stamps. Below a join stamp, new messages are silently hidden behind
+        # the join-gate; below existing message ids, history order corrupts and
+        # a new message can land in a day folder old enough for the janitor to
+        # archive it immediately. Seed the floor from both: every join stamp
+        # (one small file per membership) and the newest message id per group
+        # (msg_dirs_newest_first is lazy — day names plus one day's entries).
+        self._last_ms = max(self._last_ms, self._clock_floor())
 
-    def _max_join_stamp(self) -> int:
+    def _clock_floor(self) -> int:
         floor = 0
         groups = self.root / "groups"
         try:
@@ -58,6 +62,12 @@ class Store:
                         pass
             except OSError:
                 pass
+            newest = next(msg_dirs_newest_first(gdir), None)
+            if newest is not None:
+                try:
+                    floor = max(floor, int(newest.name[:13]))
+                except ValueError:
+                    pass
         return floor
 
     def next_ts(self) -> int:
@@ -216,9 +226,13 @@ class Store:
         (tmp / "auth.json").write_bytes(json.dumps(auth).encode())
         try:
             os.rename(tmp, d)   # atomic; fails if a racing create populated d
-        except OSError:
+        except OSError as e:
             shutil.rmtree(tmp, ignore_errors=True)
-            raise ApiError(409, "user exists")
+            # only a lost create-race is "exists"; a filesystem error (ENOSPC,
+            # EXDEV) is transient and must not masquerade as a taken name
+            if e.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR):
+                raise ApiError(409, "user exists")
+            raise ApiError(503, "user create failed, please retry")
 
     def user_exists(self, user: str) -> bool:
         return bool(USER_RE.match(user)) and (self.user_dir(user) / "auth.json").is_file()

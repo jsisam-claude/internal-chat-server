@@ -255,9 +255,10 @@ class Api:
         link = self.store.queue_dir(user) / entry
         if not link.is_symlink():
             raise ApiError(404, "not in your queue")
-        # the link can be unlinked concurrently (a second device confirming, or
-        # the janitor); realpath then raises FileNotFoundError — that just means
-        # the entry is gone, which is a 404, not a 500
+        # realpath resolves an already-missing path lexically, but a symlink
+        # unlinked WHILE it resolves (second device draining, or the janitor)
+        # raises FileNotFoundError from the readlink inside — proven by the
+        # concurrency fuzzer. Gone is gone: 404, not 500.
         try:
             mdir = Path(os.path.realpath(link))
         except FileNotFoundError:
@@ -277,7 +278,11 @@ class Api:
         if int(mdir.name[:13]) < self.store.joined_at(gid, user):
             link.unlink(missing_ok=True)
             raise ApiError(404, "message gone")
-        return self.render_msg(mdir, user)
+        try:
+            return self.render_msg(mdir, user)
+        except FileNotFoundError:
+            # the janitor archived this message's day folder mid-render
+            raise ApiError(404, "message gone")
 
     def _stamp(self, mdir: Path, user: str, kind: str) -> bool:
         """One code path for both flags: create the marker and queue the
@@ -306,12 +311,12 @@ class Api:
             if not m:
                 raise ApiError(400, "bad queue entry")
             link = self.store.queue_dir(user) / name
-            # A second device draining the SAME queue (or the janitor's
-            # dangling-link prune) can unlink this entry between our checks;
-            # os.path.realpath then raises FileNotFoundError. The entry is
-            # already gone, which is exactly the outcome we wanted — treat any
-            # such disappearance as done, never a 500 (same guard _queue_items
-            # uses).
+            # Two real FileNotFoundError sources in this body, both proven by
+            # the concurrency fuzzer: realpath raises if a second device (or
+            # the janitor) unlinks the symlink mid-resolution (its internal
+            # readlink TOCTOU), and _stamp's mkdir/read raises if the janitor
+            # archives the message dir mid-confirm. Either way the entry's
+            # work is moot — treat the disappearance as done, never a 500.
             try:
                 if not link.is_symlink():
                     continue
@@ -621,8 +626,12 @@ class Api:
         mid = mdir.name
         atts = []
         adir = mdir / "attachments"
-        if adir.is_dir():
-            for metaf in sorted(adir.glob("*.meta")):
+        try:
+            # A concurrent delete rmtree's this dir between is_dir and the
+            # glob (pathlib's glob raises FileNotFoundError when the dir
+            # vanishes mid-scan), and can remove individual meta files under
+            # the read. Either way the bytes are going: render no attachments.
+            for metaf in sorted(adir.glob("*.meta")) if adir.is_dir() else []:
                 try:
                     meta = json.loads(metaf.read_text())
                     a = {"n": int(metaf.name.split(".")[0]),
@@ -635,8 +644,10 @@ class Api:
                     if meta.get("video"):   # ditto — inline <video> playback
                         a["video"] = meta["video"]
                     atts.append(a)
-                except (ValueError, KeyError):
+                except (OSError, ValueError, KeyError):
                     continue
+        except OSError:
+            atts = []
         gid = self.store.gid_of(mdir)
         sender = (mdir / "from").read_text().strip()
         at = int(mid[:13])
@@ -724,7 +735,11 @@ class Api:
         flags-only response, under the same authorization."""
         if not (GID_RE.match(gid) and MID_RE.match(mid)):
             raise ApiError(400, "bad ids")
-        return self.render_msg(self._visible_mdir(user, gid, mid), user)
+        try:
+            return self.render_msg(self._visible_mdir(user, gid, mid), user)
+        except FileNotFoundError:
+            # the janitor archived this message's day folder mid-render
+            raise ApiError(404, "message gone")
 
     def history(self, user: str, gid: str, before: str | None, limit: int) -> dict:
         if not GID_RE.match(gid):
@@ -741,7 +756,10 @@ class Api:
                 break  # newest-first: everything after this predates the join
             if before and mdir.name >= before:
                 continue
-            out.append(self.render_msg(mdir, user))
+            try:
+                out.append(self.render_msg(mdir, user))
+            except FileNotFoundError:
+                continue   # day folder archived mid-walk: skip, don't 500
             if len(out) >= limit:
                 break
         return {"messages": out}
@@ -794,7 +812,10 @@ class Api:
             if not self.can_see(user, gid, mid) or (mdir / "deleted").is_file():
                 marker.unlink(missing_ok=True)
                 continue
-            out.append(self.render_msg(mdir, user))
+            try:
+                out.append(self.render_msg(mdir, user))
+            except FileNotFoundError:
+                continue   # message archived mid-walk: prune on next pass
             if len(out) >= 200:
                 break
         return {"messages": out}
@@ -966,8 +987,10 @@ class Api:
             self.store.spool_system(u, gid, f"{u} left",
                                     {"event": "leave", "user": u})
             (md / u).unlink(missing_ok=True)
-            # leaving sweeps this group's entries out of the leaver's queue;
-            # guard the realpath against a concurrent drain unlinking the entry
+            # leaving sweeps this group's entries out of the leaver's queue.
+            # realpath raises FileNotFoundError if a concurrent drain unlinks
+            # the symlink mid-resolution (its internal readlink TOCTOU) — the
+            # entry is gone either way, which is what this sweep wanted.
             for link in self.store.queue_dir(u).iterdir():
                 try:
                     if (link.is_symlink()

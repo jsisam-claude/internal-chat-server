@@ -23,17 +23,20 @@ from .api import Api
 def _reject_surrogates(obj) -> None:
     """Walk a parsed JSON value and raise 400 if any string holds a lone
     surrogate (\\ud800-\\udfff). Such strings decode fine but crash on UTF-8
-    encode; bounded by MAX_JSON so the walk is cheap."""
-    if isinstance(obj, str):
-        if any("\ud800" <= c <= "\udfff" for c in obj):
-            raise ApiError(400, "bad json")
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            _reject_surrogates(k)
-            _reject_surrogates(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            _reject_surrogates(v)
+    encode; bounded by MAX_JSON so the walk is cheap. Iterative on purpose:
+    a recursive walk's stack budget would ride on json.loads having stricter
+    recursion accounting, which is a CPython detail, not a guarantee."""
+    stack = [obj]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, str):
+            if any("\ud800" <= c <= "\udfff" for c in o):
+                raise ApiError(400, "bad json")
+        elif isinstance(o, dict):
+            stack.extend(o.keys())
+            stack.extend(o.values())
+        elif isinstance(o, list):
+            stack.extend(o)
 
 
 class Handler(BaseHTTPRequestHandler):

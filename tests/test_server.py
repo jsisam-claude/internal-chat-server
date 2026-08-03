@@ -1543,9 +1543,13 @@ class ChatServerTest(unittest.TestCase):
 
     def test_71_deeply_nested_json_is_rejected_not_500(self):
         # A "[[[[..." body blows json's C recursion limit; RecursionError must
-        # be caught and turned into a 400, not surface as a 500.
-        r, _ = self.req("POST", "/api/login", raw=True,
-                        body=b"[" * 100000,
+        # be caught and turned into a 400, not surface as a 500. The body must
+        # stay UNDER MAX_JSON (64 KB) or the size guard rejects it first and
+        # this test never reaches json.loads at all.
+        from internalchat.config import MAX_JSON
+        body = b"[" * 60000
+        self.assertLessEqual(len(body), MAX_JSON)
+        r, _ = self.req("POST", "/api/login", raw=True, body=body,
                         headers={"Content-Type": "application/json"})
         self.assertEqual(r.status, 400)
 
@@ -1581,6 +1585,33 @@ class ChatServerTest(unittest.TestCase):
         r, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1",
                         user="t73a", raw=True)
         self.assertEqual(r.status, 404)
+
+    def test_75_id_clock_floor_survives_lost_hwm(self):
+        # The persisted hwm is best-effort. If it is lost AND the wall clock
+        # steps back, a fresh Store must still reconstruct a floor above every
+        # existing join stamp (join-gate) and message id (history order, day
+        # archiving) from the durable tree alone.
+        self.fresh("t75a", "t75b")
+        gid = self.send_msg("t75a", "before restart", to="t75b")["gid"]
+        mid = self.send_msg("t75a", "newest", gid=gid)["id"]
+        import time as _time
+        for _ in range(60):          # wait for the router to file it
+            if self.store.msg_dir(gid, mid).is_dir():
+                break
+            _time.sleep(0.05)
+        (self.store.root / "id_hwm").unlink()          # simulate the lost hwm
+        # ...and the backward clock step (without it, next_ts passes trivially
+        # via now_ms and the floor is never exercised)
+        import internalchat.store as smod
+        real_now = smod.now_ms
+        try:
+            smod.now_ms = lambda: 1_000_000
+            reopened = chatserver.Store(self.tmp, iters=1000)
+            ts = reopened.next_ts()
+        finally:
+            smod.now_ms = real_now
+        self.assertGreater(ts, int(mid[:13]))
+        self.assertGreater(ts, self.store.joined_at(gid, "t75b"))
 
     def test_74_nan_wait_does_not_wedge_the_poll(self):
         # wait=nan used to leave the poll deadline as nan (never elapses),
