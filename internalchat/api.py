@@ -662,8 +662,12 @@ class Api:
         if not dims:
             return 0, 0
         w_s, sep, h_s = dims.partition("x")
-        if not (sep and w_s.isascii() and w_s.isdigit()
-                and h_s.isascii() and h_s.isdigit()):
+        # length cap BEFORE int(): a >=4301-digit string trips Python's
+        # int-string conversion limit and raises ValueError (not the (0,0) the
+        # contract promises), which upstream would misread as "file already
+        # sent" and drop a perfectly good thumb. Max is 10000 → 5 digits.
+        if not (sep and w_s.isascii() and w_s.isdigit() and len(w_s) <= 5
+                and h_s.isascii() and h_s.isdigit() and len(h_s) <= 5):
             return 0, 0
         w, h = int(w_s), int(h_s)
         if not (1 <= w <= 10000 and 1 <= h <= 10000):

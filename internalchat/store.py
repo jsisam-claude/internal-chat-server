@@ -417,11 +417,22 @@ class Store:
                 for i, (src, meta) in enumerate(srcs, 1):
                     os.replace(src, b / "attachments" / str(i))
                     os.replace(meta, b / "attachments" / f"{i}.meta")
-                    # the optional sender-generated preview rides along; its
-                    # accounting lives inside the .meta ("thumb" key)
+                    # The optional preview rides along ONLY if the meta commits
+                    # to it. upload_thumb writes the .thumb file BEFORE recording
+                    # it in the meta, so a "thumb" key implies the file; a
+                    # .thumb without the key is an upload still in flight —
+                    # leaving it in staged lets upload_thumb's own meta-gone path
+                    # (or the janitor) reclaim it, instead of stranding an
+                    # un-servable orphan whose bytes drift the quota counter.
                     tsrc = src.with_name(src.name + ".thumb")
                     if tsrc.is_file():
-                        os.replace(tsrc, b / "attachments" / f"{i}.thumb")
+                        try:
+                            committed = "thumb" in json.loads(
+                                (b / "attachments" / f"{i}.meta").read_text())
+                        except (OSError, ValueError):
+                            committed = False
+                        if committed:
+                            os.replace(tsrc, b / "attachments" / f"{i}.thumb")
                 os.replace(b, self.root / "incoming" / mid)
             except OSError:  # janitor pruned a staged file mid-move, or fs error
                 shutil.rmtree(b, ignore_errors=True)

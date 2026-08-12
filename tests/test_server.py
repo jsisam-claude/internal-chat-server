@@ -1990,6 +1990,12 @@ class ChatServerTest(unittest.TestCase):
         # garbage dims are ignored, not an error; then a second thumb is a 409
         st, r = self.send_thumb("t86a", fid, self.PNG + b"t", dims="0x999999")
         self.assertEqual(st, 200, r)
+        # a pathologically long digit string must be IGNORED, not crash int()
+        # (Python's 4300-digit conversion limit) and get dropped as a bad 409
+        up2 = self.upload("t86a", self.PNG + b"z", name="b.png")
+        st, r = self.send_thumb("t86a", up2["file_id"], self.PNG + b"t",
+                                dims=("1" * 5000) + "x5")
+        self.assertEqual(st, 200, r)   # accepted; over-long dims just ignored
         st, _ = self.send_thumb("t86a", fid, self.PNG + b"t2")
         self.assertEqual(st, 409)
         sent = self.send_msg("t86a", "", to="t86b", files=[fid])
