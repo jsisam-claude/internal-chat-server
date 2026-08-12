@@ -187,6 +187,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(api.star(self._user(), self._json_body()))
             if p == ["typing"]:
                 return self._send_json(api.typing(self._user(), self._json_body()))
+            if len(p) == 3 and p[0] == "files" and p[2] == "thumb":
+                user = self._user()
+                try:
+                    tlen = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    tlen = 0
+                return self._send_json(api.upload_thumb(
+                    user, p[1], self.rfile, tlen,
+                    self.headers.get("X-Media-Dims")))
             if p == ["files"]:
                 user = self._user()
                 try:
@@ -246,7 +255,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._user(), q.get("q", [""])[0],
                 q.get("gid", [None])[0], limit))
         if len(p) == 4 and p[0] == "attachments":
-            blob, meta = api.attachment(self._user(), p[1], p[2], p[3])
+            blob, meta = api.attachment(self._user(), p[1], p[2], p[3],
+                                        thumb=q.get("thumb", ["0"])[0] == "1")
             # inline rendering is allowed ONLY for media the server verified
             # by magic bytes at upload — the request cannot force it
             media = (meta.get("image") or meta.get("audio")

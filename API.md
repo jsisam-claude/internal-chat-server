@@ -127,6 +127,30 @@ carry `Content-Security-Policy: default-src 'none'; sandbox`, so the bytes
 can never act as a document or run script even if a client dereferenced them
 directly. SVG is never inline-eligible (scriptable XML).
 
+`?thumb=1` serves the sender-generated preview of an attachment (its stored,
+magic-verified `image/*` type), `404` when the sender didn't provide one.
+Same auth gates, same header set, its own `sha256` as the ETag.
+
+### `POST /api/files/<file_id>/thumb` — attach a preview to a staged upload
+
+Raw request body: a **≤ 64 KiB** image that must itself pass the same
+magic-byte allowlist as any inline image (png/jpeg/gif/webp — SVG is
+structurally impossible). Optional `X-Media-Dims: <w>x<h>` records the
+*original's* pixel dimensions (bounded ints, ignored when malformed) so
+clients can reserve layout before the bytes arrive. One thumb per staged
+file (`409` on a second), `404` for an unknown/expired/consumed id.
+
+The server never decodes anything: generation happens on the **sending
+client** (canvas downscale on web, bounded bitmap on Android; video posters
+from a locally-decoded frame). A thumb is presentation-only and carries the
+same trust class as the client-supplied filename — size-capped, sniffed to
+the safe raster allowlist, served under the sandbox CSP. Its bytes count
+against the sender's quota, expire with the staged upload, and are credited
+back when the message is deleted. On send it becomes `attachments/<n>.thumb`
+and `render_msg` marks the attachment `"thumb":true` (plus `"w"`/`"h"` when
+dims were recorded). A message sent while its thumb upload was still in
+flight simply goes out thumbless — the race is benign by design.
+
 Blob responses advertise `Accept-Ranges: bytes` and honor a single
 `Range: bytes=a-b` / `bytes=a-` / `bytes=-N` with a byte-exact `206` +
 `Content-Range` (multipart or malformed ranges are ignored and answered with

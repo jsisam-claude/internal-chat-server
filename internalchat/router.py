@@ -239,6 +239,16 @@ class Janitor(threading.Thread):
             try:
                 if now - p.lstat().st_mtime <= 86400:
                     continue
+                if p.name.endswith(".thumb"):
+                    # a preview expires on its own clock (written seconds after
+                    # its blob, so they age together); its bytes were reserved
+                    # at upload and are credited from the file itself — the
+                    # blob's .meta may already be gone from its own prune
+                    size = p.stat().st_size
+                    p.unlink(missing_ok=True)
+                    if size:
+                        self.store.add_storage(user, -size)
+                    continue
                 size = 0
                 metaf = staged / (p.name + ".meta")
                 try:

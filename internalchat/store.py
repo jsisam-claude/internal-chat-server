@@ -417,6 +417,11 @@ class Store:
                 for i, (src, meta) in enumerate(srcs, 1):
                     os.replace(src, b / "attachments" / str(i))
                     os.replace(meta, b / "attachments" / f"{i}.meta")
+                    # the optional sender-generated preview rides along; its
+                    # accounting lives inside the .meta ("thumb" key)
+                    tsrc = src.with_name(src.name + ".thumb")
+                    if tsrc.is_file():
+                        os.replace(tsrc, b / "attachments" / f"{i}.thumb")
                 os.replace(b, self.root / "incoming" / mid)
             except OSError:  # janitor pruned a staged file mid-move, or fs error
                 shutil.rmtree(b, ignore_errors=True)

@@ -511,8 +511,11 @@ class Api:
         try:
             for metaf in adir.glob("*.meta"):
                 try:
-                    freed += json.loads(metaf.read_text()).get("size", 0)
-                except (OSError, ValueError):
+                    meta = json.loads(metaf.read_text())
+                    freed += meta.get("size", 0)
+                    if isinstance(meta.get("thumb"), dict):   # preview bytes
+                        freed += meta["thumb"].get("size", 0)  # count too
+                except (OSError, ValueError, TypeError, AttributeError):
                     pass
         except OSError:
             pass          # already gone: nothing of ours left to credit
@@ -544,7 +547,8 @@ class Api:
         self.upload_limiter.check(user)   # cap upload rate per user
         udir = self.store.user_dir(user)
         staged = udir / "staged"
-        if sum(1 for p in staged.iterdir() if not p.name.endswith(".meta")) >= MAX_STAGED:
+        if sum(1 for p in staged.iterdir()
+               if not p.name.endswith((".meta", ".thumb"))) >= MAX_STAGED:
             raise ApiError(429, "too many staged uploads; send or wait")
         # RESERVE the bytes under the lock before streaming, so concurrent
         # uploads can't collectively overshoot the quota; credited back if the
@@ -592,7 +596,82 @@ class Api:
             out[av[0]] = av[1]
         return out
 
-    def attachment(self, user: str, gid: str, mid: str, n: str):
+    MAX_THUMB = 64 * 1024   # a preview is kilobytes; anything bigger is abuse
+
+    def upload_thumb(self, user: str, fid: str, rfile, length: int,
+                     dims: str | None) -> dict:
+        """Sender-generated preview for a STAGED upload. The server stays
+        never-decode: the thumb is opaque bytes that must pass the same
+        image_mime magic-byte allowlist as any inline image (so SVG is
+        structurally impossible), is size-capped, and is presentation-only —
+        the same trust class as the client-supplied filename. X-Media-Dims
+        carries the ORIGINAL's WxH so clients can reserve layout; bounded
+        ints, ignored when malformed."""
+        if not FID_RE.match(fid):
+            raise ApiError(400, "bad file id")
+        if length <= 0 or length > self.MAX_THUMB:
+            raise ApiError(413, f"thumb must be 1..{self.MAX_THUMB} bytes")
+        self.upload_limiter.check(user)
+        staged = self.store.user_dir(user) / "staged"
+        metaf = staged / (fid + ".meta")
+        if not ((staged / fid).is_file() and metaf.is_file()):
+            raise ApiError(404, "unknown file id (upload first)")
+        tdst = staged / (fid + ".thumb")
+        if tdst.exists():
+            raise ApiError(409, "thumb already uploaded")
+        # same reserve-then-stream discipline as upload(): the bytes count
+        # against quota from the first moment they can hit the disk
+        self.store.reserve_storage(user, length, USER_STORAGE_QUOTA)
+        try:
+            body = rfile.read(length)
+            if len(body) != length:
+                raise ApiError(400, "truncated upload")
+            mime = image_mime(body[:16])
+            if not mime:
+                raise ApiError(400, "thumb must be a png/jpeg/gif/webp image")
+            tmp = self.store.root / "tmp" / f"t-{fid}"
+            with open(tmp, "wb") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(body)
+            os.replace(tmp, tdst)
+            try:
+                meta = json.loads(metaf.read_text())
+                if not isinstance(meta, dict):
+                    raise ValueError
+                meta["thumb"] = {"size": length, "mime": mime,
+                                 "sha256": hashlib.sha256(body).hexdigest()}
+                w, h = self._parse_dims(dims)
+                if w:
+                    meta["w"], meta["h"] = w, h
+                self.store.write_atomic(metaf, json.dumps(meta).encode())
+            except (OSError, ValueError):
+                # the staged file was consumed by a racing send (meta gone) or
+                # is corrupt: the thumb has nowhere to attach. Benign by
+                # design — the send proceeded thumbless; undo our half.
+                tdst.unlink(missing_ok=True)
+                raise ApiError(409, "file already sent")
+        except Exception:
+            self.store.add_storage(user, -length)   # release the reservation
+            raise
+        return {"ok": True, "thumb": mime}
+
+    @staticmethod
+    def _parse_dims(dims: str | None) -> tuple[int, int]:
+        """'WxH' with bounded ASCII ints, or (0, 0). Presentation-only, so a
+        lying client can only mis-shape its own message's placeholder."""
+        if not dims:
+            return 0, 0
+        w_s, sep, h_s = dims.partition("x")
+        if not (sep and w_s.isascii() and w_s.isdigit()
+                and h_s.isascii() and h_s.isdigit()):
+            return 0, 0
+        w, h = int(w_s), int(h_s)
+        if not (1 <= w <= 10000 and 1 <= h <= 10000):
+            return 0, 0
+        return w, h
+
+    def attachment(self, user: str, gid: str, mid: str, n: str,
+                   thumb: bool = False):
         # `str.isdigit()` is True for non-ASCII digits like "¹" (superscript
         # one), but int() then raises ValueError → 500; pin it to ASCII 0-9.
         if not (GID_RE.match(gid) and MID_RE.match(mid)
@@ -626,6 +705,21 @@ class Api:
             raise ApiError(404, "attachment meta unreadable")
         if not (isinstance(meta, dict) and "name" in meta and "size" in meta):
             raise ApiError(404, "attachment meta unreadable")
+        if thumb:
+            # ?thumb=1: swap in the preview blob under a REMAPPED meta, so the
+            # route serves it through the identical _send_blob path — same
+            # sandbox/nosniff/CORP set, its own sha256 as the cache validator.
+            # The thumb passed image_mime at upload, so "image" is always the
+            # verified inline type here.
+            t = meta.get("thumb")
+            tblob = mdir / "attachments" / f"{int(n)}.thumb"
+            if not (isinstance(t, dict) and t.get("mime")
+                    and tblob.is_file()):
+                raise ApiError(404, "no thumbnail for this attachment")
+            return tblob, {"name": "thumb-" + meta["name"],
+                           "size": t.get("size", 0),
+                           "sha256": t.get("sha256"),
+                           "image": t["mime"]}
         return blob, meta
 
     # ---- reading -----------------------------------------------------------
@@ -654,6 +748,10 @@ class Api:
                         a["audio"] = meta["audio"]
                     if meta.get("video"):   # ditto — inline <video> playback
                         a["video"] = meta["video"]
+                    if isinstance(meta.get("thumb"), dict):
+                        a["thumb"] = True   # fetch via ?thumb=1
+                    if meta.get("w") and meta.get("h"):
+                        a["w"], a["h"] = meta["w"], meta["h"]
                     atts.append(a)
                 except (OSError, ValueError, KeyError):
                     continue

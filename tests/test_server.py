@@ -1922,5 +1922,114 @@ class ChatServerTest(unittest.TestCase):
             self.confirm("t84b", [sent["id"]])
 
 
+    # ---- sender-generated thumbnails (rank 7 of the media plan) -------------
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 200
+
+    def send_thumb(self, user, fid, body, dims=None):
+        headers = {}
+        if dims is not None:
+            headers["X-Media-Dims"] = dims
+        return self.req("POST", f"/api/files/{fid}/thumb", user=user,
+                        body=body, headers=headers)
+
+    def test_85_thumbnail_roundtrip(self):
+        self.fresh("t85a", "t85b")
+        up = self.upload("t85a", self.PNG + b"orig" * 500, name="photo.png")
+        thumb = self.PNG + b"tiny"
+        st, r = self.send_thumb("t85a", up["file_id"], thumb, dims="800x600")
+        self.assertEqual(st, 200, r)
+        self.assertEqual(r["thumb"], "image/png")
+        sent = self.send_msg("t85a", "pic", to="t85b", files=[up["file_id"]])
+        gid, mid = sent["gid"], sent["id"]
+        ev = self.poll_until("t85b", lambda e: e["id"] == mid)
+        _, m = self.req("GET", f"/api/message/dequeue/{mid}", user="t85b")
+        a = m["attachments"][0]
+        self.assertTrue(a.get("thumb"))
+        self.assertEqual((a.get("w"), a.get("h")), (800, 600))
+        # the preview serves through the same hardened blob path: verified
+        # inline type, its own sha256 ETag, sandbox CSP
+        r2, body = self.req(
+            "GET", f"/api/attachments/{gid}/{mid}/1?thumb=1&inline=1",
+            user="t85b", raw=True)
+        self.assertEqual(r2.status, 200)
+        self.assertEqual(body, thumb)
+        self.assertEqual(r2.headers["Content-Type"], "image/png")
+        self.assertIn("sandbox", r2.headers.get("Content-Security-Policy", ""))
+        self.assertEqual(r2.headers.get("ETag"),
+                         '"%s"' % __import__("hashlib").sha256(thumb).hexdigest())
+        # the original is untouched under the plain path
+        r3, body3 = self.req(f"GET", f"/api/attachments/{gid}/{mid}/1",
+                             user="t85b", raw=True)
+        self.assertEqual(body3, self.PNG + b"orig" * 500)
+        # an attachment whose sender provided no thumb 404s under ?thumb=1
+        up2 = self.upload("t85a", self.PNG + b"other", name="p2.png")
+        sent2 = self.send_msg("t85a", "", gid=gid, files=[up2["file_id"]])
+        self.poll_until("t85b", lambda e: e["id"] == sent2["id"])
+        st4, _ = self.req(
+            "GET", f"/api/attachments/{gid}/{sent2['id']}/1?thumb=1",
+            user="t85b")
+        self.assertEqual(st4, 404)
+        self.confirm("t85b", [ev["entry"]])
+
+    def test_86_thumbnail_posture_and_edges(self):
+        self.fresh("t86a", "t86b")
+        up = self.upload("t86a", self.PNG + b"x", name="a.png")
+        fid = up["file_id"]
+        # non-image bytes can never become a servable "image" preview
+        st, _ = self.send_thumb("t86a", fid, b"<html>not an image</html>")
+        self.assertEqual(st, 400)
+        # over the 64 KiB cap
+        st, _ = self.send_thumb("t86a", fid, self.PNG + b"\x00" * (64 * 1024))
+        self.assertEqual(st, 413)
+        # unknown fid / someone else's fid (staged dirs are per-user)
+        st, _ = self.send_thumb("t86a", "0" * 32, self.PNG)
+        self.assertEqual(st, 404)
+        st, _ = self.send_thumb("t86b", fid, self.PNG)
+        self.assertEqual(st, 404)
+        # garbage dims are ignored, not an error; then a second thumb is a 409
+        st, r = self.send_thumb("t86a", fid, self.PNG + b"t", dims="0x999999")
+        self.assertEqual(st, 200, r)
+        st, _ = self.send_thumb("t86a", fid, self.PNG + b"t2")
+        self.assertEqual(st, 409)
+        sent = self.send_msg("t86a", "", to="t86b", files=[fid])
+        self.poll_until("t86b", lambda e: e["id"] == sent["id"])
+        _, m = self.req("GET", f"/api/message/dequeue/{sent['id']}",
+                        user="t86b")
+        a = m["attachments"][0]
+        self.assertTrue(a.get("thumb"))
+        self.assertNotIn("w", a)     # the bad dims header left no dimensions
+
+    def test_87_thumbnail_quota_accounting(self):
+        self.fresh("t87a", "t87b")
+        base = self.store.storage_used("t87a")
+        # exact byte budgets (PNG magic is 8 bytes): blob 1000, thumb 200
+        blob = b"\x89PNG\r\n\x1a\n" + b"B" * 992
+        thumb = b"\x89PNG\r\n\x1a\n" + b"T" * 192
+        up = self.upload("t87a", blob, name="q.png")
+        st, _ = self.send_thumb("t87a", up["file_id"], thumb)
+        self.assertEqual(st, 200)
+        self.assertEqual(self.store.storage_used("t87a"), base + 1200)
+        sent = self.send_msg("t87a", "", to="t87b", files=[up["file_id"]])
+        self.poll_until("t87b", lambda e: e["id"] == sent["id"])
+        # the recount (janitor truth) agrees: routed blob + thumb both counted
+        self.assertEqual(self.store.recount_all_storage()["t87a"], base + 1200)
+        # delete-for-everyone credits blob AND thumb back
+        self.req("POST", "/api/message/delete", user="t87a",
+                 body={"gid": sent["gid"], "mid": sent["id"]})
+        self.assertEqual(self.store.storage_used("t87a"), base)
+        # an expired staged pair (blob+meta+thumb) is pruned and credited
+        up2 = self.upload("t87a", blob, name="q2.png")
+        st, _ = self.send_thumb("t87a", up2["file_id"], thumb)
+        self.assertEqual(st, 200)
+        staged = self.store.user_dir("t87a") / "staged"
+        for suffix in ("", ".meta", ".thumb"):
+            f = staged / (up2["file_id"] + suffix)
+            os.utime(f, (1, 1))               # ancient: way past the 24h TTL
+        chatserver.Janitor(self.store, interval=3600).clean()
+        self.assertEqual(self.store.storage_used("t87a"), base)
+        self.assertFalse((staged / (up2["file_id"] + ".thumb")).exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
