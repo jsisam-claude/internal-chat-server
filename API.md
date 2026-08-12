@@ -121,11 +121,23 @@ Membership-checked. By default `application/octet-stream` +
 `?inline=1` returns the image inline (its verified `image/*` type,
 `Content-Disposition: inline`) **only if** the server flagged the attachment
 as a verified image at upload; otherwise the flag is ignored and the response
-stays a forced octet-stream download. Inline responses additionally carry
-`Content-Security-Policy: default-src 'none'; sandbox` and
-`Cross-Origin-Resource-Policy: same-origin`, so the bytes can never act as a
-document or run script even if a client dereferenced them directly. SVG is
-never inline-eligible (scriptable XML).
+stays a forced octet-stream download. Every attachment response carries
+`Cross-Origin-Resource-Policy: same-origin`; inline responses additionally
+carry `Content-Security-Policy: default-src 'none'; sandbox`, so the bytes
+can never act as a document or run script even if a client dereferenced them
+directly. SVG is never inline-eligible (scriptable XML).
+
+Blob responses advertise `Accept-Ranges: bytes` and honor a single
+`Range: bytes=a-b` / `bytes=a-` / `bytes=-N` with a byte-exact `206` +
+`Content-Range` (multipart or malformed ranges are ignored and answered with
+the full `200`, as RFC 9110 permits; an unsatisfiable range is `416` with
+`Content-Range: bytes */<size>`). A routed blob never changes (deleting the
+message 404s the path via its tombstone), so responses also carry
+`ETag: "<sha256>"` and `Cache-Control: private, max-age=31536000, immutable`;
+`If-None-Match` revalidates to a bodiless `304` and `If-Range` gates resumed
+downloads (mismatch → full `200`). `HEAD` works on every GET endpoint and
+returns the same headers — including the true `Content-Length` — with no
+body.
 
 ## 4. Conversations & directory
 
@@ -176,3 +188,26 @@ send:  [POST /api/files]* → POST /api/messages   (outbox until 200, then ✓)
 
 Reconnect/reinstall needs no special path: history + flag maps rebuild the
 entire UI state; the queue only makes it live.
+
+## Security posture — do NOT weaken
+
+Invariants that hold everywhere above, written down so a future change can't
+erode them one convenience at a time (util.py's magic-byte allowlists
+cross-reference this section):
+
+- **The server never decodes uploads.** No server-side thumbnailing,
+  transcoding, EXIF parsing, or PDF rasterizing — classification is a
+  constant-offset magic-byte comparison (util.py) and nothing more. Every
+  media parser added server-side is remote attack surface reachable by any
+  authenticated user's uploaded bytes.
+- **SVG is never inline.** It is scriptable XML; whatever its filename or
+  the `inline` flag says, it is served only as a forced
+  `application/octet-stream` download.
+- **PDF is never inline, even sandboxed.** PDF viewers are their own
+  script-capable document surface, and a sandbox CSP does not reliably reach
+  plugin/viewer contexts — PDFs stay forced downloads.
+- **Any new response status on the attachment path must carry the full
+  header set**: `X-Content-Type-Options: nosniff`, the sandbox CSP whenever
+  inline was granted, `Cross-Origin-Resource-Policy: same-origin`, and HSTS
+  over TLS. `200`, `206`, `304`, and `416` all do today; a status added
+  without them becomes the one response an attacker aims for.

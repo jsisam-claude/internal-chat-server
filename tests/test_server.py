@@ -1621,6 +1621,306 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertIn("queue", resp)
 
+    # ---- blob caching / ranges / HEAD (the _send_blob hardening round) -------
+
+    def routed_attachment(self, a, b, payload, name="blob.bin"):
+        """Upload `payload` as `a`, send it to `b`, wait until routed;
+        returns (gid, mid, upload-response). The wait is load-bearing, not
+        politeness: the attachment path 404s while the message is still in
+        incoming/, and poll_until only returns once the router has filed it
+        into the group folder and queued b's entry."""
+        up = self.upload(a, payload, name)
+        sent = self.send_msg(a, "", to=b, files=[up["file_id"]])
+        self.poll_until(b, lambda e: e["id"] == sent["id"])
+        return sent["gid"], sent["id"], up
+
+    def test_76_range_windows_are_byte_exact(self):
+        # Seeking media is the point of ranges: every window must be
+        # byte-exact — including the suffix ('bytes=-N') and open-ended
+        # ('bytes=a-') forms — and a 206 must carry the same header set a
+        # 200 does, or a ranged fetch becomes the weakest response.
+        self.fresh("t76a", "t76b")
+        payload = bytes(range(256)) * 4          # 1024 bytes, position-coded
+        gid, mid, up = self.routed_attachment("t76a", "t76b", payload)
+        url = f"/api/attachments/{gid}/{mid}/1"
+        r, data = self.req("GET", url, user="t76b", raw=True)
+        self.assertEqual((r.status, data), (200, payload))
+        self.assertEqual(r.getheader("Accept-Ranges"), "bytes")  # advertised
+        for hdr, s, e in (("bytes=0-99", 0, 99),
+                          ("bytes=100-199", 100, 199),
+                          ("bytes=1000-", 1000, 1023),     # open-ended tail
+                          ("bytes=-24", 1000, 1023),       # suffix form
+                          ("bytes=-9999", 0, 1023),        # suffix > file
+                          ("bytes=500-9999", 500, 1023)):  # end clamped
+            r, data = self.req("GET", url, user="t76b", raw=True,
+                               headers={"Range": hdr})
+            self.assertEqual(r.status, 206, hdr)
+            self.assertEqual(data, payload[s:e + 1], hdr)
+            self.assertEqual(r.getheader("Content-Range"),
+                             f"bytes {s}-{e}/1024", hdr)
+            self.assertEqual(r.getheader("Content-Length"), str(e - s + 1))
+            # the full 200 header set rides on every 206
+            self.assertEqual(r.getheader("X-Content-Type-Options"), "nosniff")
+            self.assertEqual(r.getheader("Cross-Origin-Resource-Policy"),
+                             "same-origin")
+            self.assertEqual(r.getheader("ETag"), f'"{up["sha256"]}"')
+            self.assertIn("immutable", r.getheader("Cache-Control"))
+            self.assertIn("attachment", r.getheader("Content-Disposition"))
+        self.confirm("t76b", [mid])
+
+    def test_77_range_416_and_malformed_fall_back_to_200(self):
+        self.fresh("t77a", "t77b")
+        payload = os.urandom(300)
+        gid, mid, _ = self.routed_attachment("t77a", "t77b", payload)
+        url = f"/api/attachments/{gid}/{mid}/1"
+        # a start at/past EOF and the zero-byte suffix are unsatisfiable
+        for hdr in ("bytes=300-", "bytes=300-400", "bytes=5000-6000",
+                    "bytes=-0"):
+            r, data = self.req("GET", url, user="t77b", raw=True,
+                               headers={"Range": hdr})
+            self.assertEqual(r.status, 416, hdr)
+            self.assertEqual(r.getheader("Content-Range"), "bytes */300", hdr)
+            self.assertEqual(data, b"", hdr)
+        # malformed and multipart ranges are IGNORED (RFC-permitted): full
+        # 200. "¹" exercises the ASCII pin (isdigit() passes, int() raises).
+        for hdr in ("bytes=abc", "bytes=5-2", "bytes=0-5,10-20", "bytes=¹-5",
+                    "bites=0-5", "bytes=--3", "bytes=", "bytes=5"):
+            r, data = self.req("GET", url, user="t77b", raw=True,
+                               headers={"Range": hdr})
+            self.assertEqual(r.status, 200, hdr)
+            self.assertEqual(data, payload, hdr)
+        self.confirm("t77b", [mid])
+
+    def test_78_if_range_gates_the_partial(self):
+        # If-Range: a resuming client proves it holds the same bytes; on any
+        # mismatch the server must send the WHOLE file, or the client would
+        # splice halves of two different representations together.
+        self.fresh("t78a", "t78b")
+        payload = os.urandom(512)
+        gid, mid, up = self.routed_attachment("t78a", "t78b", payload)
+        url = f"/api/attachments/{gid}/{mid}/1"
+        etag = f'"{up["sha256"]}"'
+        r, data = self.req("GET", url, user="t78b", raw=True,
+                           headers={"Range": "bytes=100-199",
+                                    "If-Range": etag})
+        self.assertEqual((r.status, data), (206, payload[100:200]))
+        # wrong etag, and a weak validator (If-Range is strong-only per RFC)
+        for stale in ('"deadbeef"', "W/" + etag):
+            r, data = self.req("GET", url, user="t78b", raw=True,
+                               headers={"Range": "bytes=100-199",
+                                        "If-Range": stale})
+            self.assertEqual(r.status, 200, stale)
+            self.assertEqual(data, payload, stale)
+        self.confirm("t78b", [mid])
+
+    def test_79_if_none_match_returns_bodiless_304(self):
+        self.fresh("t79a", "t79b")
+        payload = os.urandom(256)
+        gid, mid, up = self.routed_attachment("t79a", "t79b", payload)
+        url = f"/api/attachments/{gid}/{mid}/1"
+        etag = f'"{up["sha256"]}"'
+        r, _ = self.req("GET", url, user="t79b", raw=True)
+        self.assertEqual(r.getheader("ETag"), etag)
+        self.assertEqual(r.getheader("Cache-Control"),
+                         "private, max-age=31536000, immutable")
+        # exact, weak-prefixed, listed, and wildcard forms all revalidate
+        for inm in (etag, "W/" + etag, f'"nope", {etag}', "*"):
+            r, data = self.req("GET", url, user="t79b", raw=True,
+                               headers={"If-None-Match": inm})
+            self.assertEqual(r.status, 304, inm)
+            self.assertEqual(data, b"", inm)          # NO body on a 304
+            self.assertEqual(r.getheader("ETag"), etag, inm)
+            self.assertIn("immutable", r.getheader("Cache-Control"), inm)
+        # a non-matching validator serves the bytes
+        r, data = self.req("GET", url, user="t79b", raw=True,
+                           headers={"If-None-Match": '"deadbeef"'})
+        self.assertEqual((r.status, data), (200, payload))
+        self.confirm("t79b", [mid])
+
+    def test_80_head_mirrors_get_without_a_body(self):
+        self.fresh("t80a", "t80b")
+        payload = os.urandom(400)
+        gid, mid, _ = self.routed_attachment("t80a", "t80b", payload)
+        url = f"/api/attachments/{gid}/{mid}/1"
+        g, _ = self.req("GET", url, user="t80b", raw=True)
+        h, hbody = self.req("HEAD", url, user="t80b", raw=True)
+        self.assertEqual(h.status, 200)
+        self.assertEqual(hbody, b"")
+        for hdr in ("Content-Type", "Content-Length", "Content-Disposition",
+                    "X-Content-Type-Options", "Cross-Origin-Resource-Policy",
+                    "Accept-Ranges", "ETag", "Cache-Control"):
+            self.assertEqual(h.getheader(hdr), g.getheader(hdr), hdr)
+        self.assertEqual(h.getheader("Content-Length"), str(len(payload)))
+        # HEAD rides the same dispatch for JSON endpoints too: the true
+        # Content-Length of the body that a GET would send, and no body
+        _, jbody = self.req("GET", f"/api/groups/{gid}", user="t80b",
+                            raw=True)
+        hj, hjbody = self.req("HEAD", f"/api/groups/{gid}", user="t80b",
+                              raw=True)
+        self.assertEqual((hj.status, hjbody), (200, b""))
+        self.assertEqual(hj.getheader("Content-Length"), str(len(jbody)))
+        # HEAD then GET on the SAME socket: the bodiless HEAD must not desync
+        # framing, and the suppress flag must reset per request (a sticky
+        # flag would silently strip the GET's body too)
+        auth = {"Authorization": "Bearer " + self.tokens["t80b"]}
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=40)
+        try:
+            conn.request("HEAD", url, headers=auth)
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.read()), (200, b""))
+            conn.request("GET", url, headers=auth)
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.read()), (200, payload))
+        finally:
+            conn.close()
+        self.confirm("t80b", [mid])
+
+    def test_81_keepalive_survives_206_304_and_truncation(self):
+        # THE framing pin: after a 206, a 304, and a response for a blob
+        # whose file was hand-truncated behind its meta, the SAME connection
+        # must serve a next request that still parses. Any Content-Length
+        # that doesn't match the bytes actually sent makes the client read
+        # the next response's status line as body tail (or hang forever) —
+        # the bug class the fstat-based sizing exists to kill.
+        self.fresh("t81a", "t81b")
+        payload = bytes(range(256)) * 2               # 512 bytes
+        gid, mid, up = self.routed_attachment("t81a", "t81b", payload)
+        url = f"/api/attachments/{gid}/{mid}/1"
+        etag = f'"{up["sha256"]}"'
+        auth = {"Authorization": "Bearer " + self.tokens["t81b"]}
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=40)
+        try:
+            # (i) a 206, then a full GET on the SAME socket
+            conn.request("GET", url, headers=dict(auth, Range="bytes=10-19"))
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.read()), (206, payload[10:20]))
+            conn.request("GET", url, headers=auth)
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.read()), (200, payload))
+            # (ii) a 304, then a full GET on the SAME socket
+            conn.request("GET", url,
+                         headers=dict(auth, **{"If-None-Match": etag}))
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.read()), (304, b""))
+            conn.request("GET", url, headers=auth)
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.read()), (200, payload))
+            # (iii) truncate the blob BEHIND its meta: Content-Length must
+            # come from the file (fstat), not meta['size'], and the
+            # connection must stay usable afterwards
+            blob = self.store.msg_dir(gid, mid) / "attachments" / "1"
+            with open(blob, "r+b") as bf:
+                bf.truncate(100)
+            conn.request("GET", url, headers=auth)
+            r = conn.getresponse()
+            self.assertEqual(r.getheader("Content-Length"), "100")
+            self.assertEqual((r.status, r.read()), (200, payload[:100]))
+            conn.request("GET", url, headers=auth)     # framing still sound
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.read()), (200, payload[:100]))
+        finally:
+            conn.close()
+        self.confirm("t81b", [mid])
+
+    def test_82_corrupt_meta_is_404_not_500(self):
+        # A crash-partial or hand-edited .meta must degrade to "not found",
+        # mirroring render_msg's tolerant parse — never a 500, and never a
+        # blob served under headers derived from garbage.
+        self.fresh("t82a", "t82b")
+        gid, mid, _ = self.routed_attachment("t82a", "t82b", b"bytes here")
+        metaf = self.store.msg_dir(gid, mid) / "attachments" / "1.meta"
+        for garbage in (b"not json {{{", b"[1, 2, 3]", b'{"nope": 1}'):
+            metaf.write_bytes(garbage)
+            status, resp = self.req("GET", f"/api/attachments/{gid}/{mid}/1",
+                                    user="t82b")
+            self.assertEqual(status, 404, (garbage, resp))
+        self.confirm("t82b", [mid])
+
+    def test_83_blob_header_posture(self):
+        # HSTS is only ever sent over TLS (the spec forbids it on plain HTTP
+        # and _hsts() checks the socket), so over this plain-HTTP test server
+        # we assert its ABSENCE plus the presence of everything else the blob
+        # path promises: CORP on downloads AND inline (no longer
+        # inline-only), immutable caching, and the sha256 ETag.
+        self.fresh("t83a", "t83b")
+        gid, mid, up = self.routed_attachment("t83a", "t83b", self.PNG_1PX,
+                                              name="p.png")
+        for q in ("", "?inline=1"):
+            r, _ = self.req("GET", f"/api/attachments/{gid}/{mid}/1{q}",
+                            user="t83b", raw=True)
+            self.assertEqual(r.status, 200, q)
+            self.assertIsNone(r.getheader("Strict-Transport-Security"), q)
+            self.assertEqual(r.getheader("Cross-Origin-Resource-Policy"),
+                             "same-origin", q)
+            self.assertEqual(r.getheader("Cache-Control"),
+                             "private, max-age=31536000, immutable", q)
+            self.assertEqual(r.getheader("ETag"), f'"{up["sha256"]}"', q)
+            self.assertEqual(r.getheader("X-Content-Type-Options"),
+                             "nosniff", q)
+        self.confirm("t83b", [mid])
+
+    def test_84_hostile_upload_matrix_posture(self):
+        # The posture net (see 'Security posture — do NOT weaken' in API.md):
+        # media keys appear ONLY per the util.py magic-byte allowlists, the
+        # filename and X-Media-Kind can never escalate a non-media file,
+        # unverified bytes stay forced octet-stream downloads even with
+        # inline=1, and every inline grant carries the sandbox CSP.
+        self.fresh("t84a", "t84b")
+        matrix = [   # (name-that-lies, hostile bytes, media key or None, hint)
+            ("doc.pdf", b"%PDF-1.7\n%\xe2\xe3\xcf\xd3 1 0 obj<<>>",
+             None, True),
+            ("art.svg", b'<svg xmlns="http://www.w3.org/2000/svg">'
+                        b"<script>alert(1)</script></svg>", None, True),
+            ("shot.png", b"<html><body><script>alert(1)</script>",
+             None, True),
+            ("data.xml", b'<?xml version="1.0"?><r/>', None, True),
+            ("pix.bmp", b"BM\x36\x00\x00\x00" + b"\x00" * 32, None, True),
+            ("scan.tiff", b"II*\x00\x08\x00\x00\x00" + b"\x00" * 24,
+             None, True),
+            ("scan2.tiff", b"MM\x00*\x00\x00\x00\x08" + b"\x00" * 24,
+             None, True),
+            ("icon.ico", b"\x00\x00\x01\x00\x01\x00" + b"\x00" * 32,
+             None, True),
+            # real mp4 bytes behind a lying .png name: the magic bytes win
+            # (video), the name is irrelevant. No hint here — on a genuine
+            # A/V container the hint may legitimately narrow video → audio,
+            # which is presentation, not escalation (test_65 covers it).
+            ("clip.png", self._bmff(b"isom") + b"\x00" * 64, "video", False),
+        ]
+        for name, payload, want, hint in matrix:
+            up = self.upload("t84a", payload, name, audio_hint=hint)
+            for key in ("image", "audio", "video"):
+                if key != want:
+                    self.assertNotIn(key, up,
+                                     f"{name}: {key} granted off-allowlist")
+            if want:
+                self.assertIn(want, up, name)
+            sent = self.send_msg("t84a", "", to="t84b",
+                                 files=[up["file_id"]])
+            self.poll_until("t84b", lambda e, m=sent["id"]: e["id"] == m)
+            r, _ = self.req(
+                "GET",
+                f"/api/attachments/{sent['gid']}/{sent['id']}/1?inline=1",
+                user="t84b", raw=True)
+            self.assertEqual(r.status, 200, name)
+            self.assertEqual(r.getheader("X-Content-Type-Options"),
+                             "nosniff", name)
+            if want is None:
+                # unverified bytes: inline=1 is ignored outright
+                self.assertEqual(r.getheader("Content-Type"),
+                                 "application/octet-stream", name)
+                self.assertTrue(r.getheader("Content-Disposition")
+                                .startswith("attachment"), name)
+                self.assertIsNone(r.getheader("Content-Security-Policy"),
+                                  name)
+            else:
+                # every inline grant carries the sandbox CSP
+                self.assertIn("sandbox",
+                              r.getheader("Content-Security-Policy"), name)
+                self.assertTrue(r.getheader("Content-Disposition")
+                                .startswith("inline"), name)
+            self.confirm("t84b", [sent["id"]])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -614,7 +614,18 @@ class Api:
         metaf = mdir / "attachments" / f"{int(n)}.meta"
         if not (blob.is_file() and metaf.is_file()):
             raise ApiError(404, "no such attachment")
-        meta = json.loads(metaf.read_text())
+        # Mirror render_msg's tolerant meta parse: a crash-partial or hand-
+        # mangled .meta is "gone", never a 500 — and the caller feeds meta
+        # straight into response headers (name, size, sha256, media type), so
+        # a meta that parses but isn't the dict the upload wrote must not get
+        # that far either. OSError covers a delete rmtree'ing the file
+        # between the is_file check and the read.
+        try:
+            meta = json.loads(metaf.read_text())
+        except (OSError, ValueError):
+            raise ApiError(404, "attachment meta unreadable")
+        if not (isinstance(meta, dict) and "name" in meta and "size" in meta):
+            raise ApiError(404, "attachment meta unreadable")
         return blob, meta
 
     # ---- reading -----------------------------------------------------------
