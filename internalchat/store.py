@@ -210,13 +210,16 @@ class Store:
 
     # ---- users / auth ----------------------------------------------------
     def add_user(self, user: str, password: str, display: str | None = None,
-                 must_change: bool = True) -> None:
+                 must_change: bool = True, bypass_roster: bool = False) -> None:
         if not USER_RE.match(user):
             raise ApiError(400, "bad username (allowed: [a-z0-9_.-]{1,32})")
         # Provisioning an account the roster doesn't list would create
         # something that can never log in; refuse instead of leaving a
-        # confusing half-provisioned name behind.
-        if not self.roster.allows(user):
+        # confusing half-provisioned name behind. `bypass_roster` is for the
+        # one caller that is about to add the entry itself (adduser
+        # --approve), which grants only AFTER this succeeds — so a failure
+        # here can never leave a grant behind.
+        if not bypass_roster and not self.roster.allows(user):
             raise ApiError(403, f"{user!r} is not on the roster "
                                 f"({self.roster.path}) — add it there first")
         d = self.user_dir(user)

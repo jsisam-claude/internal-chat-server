@@ -55,15 +55,26 @@ def _password(args, prompt: str) -> str:
 
 def cmd_adduser(args) -> None:
     store = _store(args)
-    if args.approve:
-        store.roster.approve(args.user, args.display)
-        print(f"approved {args.user!r} in {store.roster.path}")
     password = _password(args, f"initial password for {args.user}: ")
     # the roster's display name is the operator's central one; honour it
     # unless this command was given an explicit --display
     display = args.display or store.roster.display(args.user)
+    # ORDER MATTERS: grant LAST. Approving first meant a command that then
+    # failed (the account already exists, a rejected password, Ctrl-C at the
+    # prompt) still left the roster line behind — silently un-revoking an
+    # account the operator had deliberately removed, while exiting non-zero.
     store.add_user(args.user, password, display=display,
-                   must_change=not args.no_change)
+                   must_change=not args.no_change,
+                   bypass_roster=args.approve)
+    if args.approve:
+        try:
+            store.roster.approve(args.user, args.display)
+            print(f"approved {args.user!r} in {store.roster.path}")
+        except ApiError as e:
+            # the account exists but cannot connect: say so plainly rather
+            # than reporting a success the roster does not back
+            print(f"warning: account created but NOT approved: {e.message}",
+                  file=sys.stderr)
     print(f"user {args.user!r} created (must change password on first login: "
           f"{not args.no_change})")
 

@@ -2057,8 +2057,14 @@ class ChatServerTest(unittest.TestCase):
         api.login_ip_limiter.limit = 1_000_000
         api.login_limiter.limit = 1_000_000
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        # cleanups run LIFO, so register them in reverse of the order they must
+        # happen: stop the router and WAIT for it before the tree disappears,
+        # or its drain loop raises FileNotFoundError into the test output and
+        # a genuine router crash becomes indistinguishable from teardown litter
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
+        self.addCleanup(router.join, 5)
+        self.addCleanup(router.wake.set)
         self.addCleanup(router.stopping.set)
         return store, httpd.server_address[1], pw
 
@@ -2240,10 +2246,11 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(out["r"][0], 401)
 
     def test_95_roster_reload_under_concurrent_rewrite(self):
-        """Hammer the auth paths while the file is rewritten underneath them.
+        """Hammer the auth paths while the file is swapped underneath them.
         The invariant that must never bend: a user who is not in ANY version
-        of the file never gets a 200 — a half-read or mid-swap roster has to
-        deny, never guess."""
+        of the file never gets a 200. (Swaps are atomic renames here, which is
+        how editors and config management write; the torn-read and
+        stamp-collision cases are covered by test_96 and test_99.)"""
         import time as _time
         store, port, pw = self.roster_server("ra\n")
         toks = {}
@@ -2285,6 +2292,144 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(seen["rc"], {401}, "an unlisted user was let in")
         self.assertIn(200, seen["ra"], "the listed user was never served")
         self.assertNotIn(500, seen["ra"])
+
+    # ---- roster failure modes found by the adversarial round ---------------
+
+    def test_96_a_fifo_at_the_roster_path_cannot_wedge_the_server(self):
+        """The worst outcome for an allowlist is neither allow nor deny: a
+        FIFO here used to block the read while holding the lock that every
+        authenticated request needs, parking every worker thread FOREVER —
+        unrecoverable even after the FIFO was removed."""
+        import time as _time
+        store, port, pw = self.roster_server("ra\n")
+        _, a = self.rlogin(port, "ra")
+        token = a["token"]
+        pw.unlink()
+        os.mkfifo(pw)                      # no writer: a plain read never returns
+        done = {}
+
+        def call():
+            done["r"] = self.rreq(port, "GET", "/api/groups", token=token)
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        t.join(timeout=15)
+        self.assertFalse(t.is_alive(), "a FIFO roster hung a request thread")
+        self.assertEqual(done["r"][0], 401)      # not readable -> deny
+        # and it must HEAL: replacing the FIFO with a real file restores access
+        pw.unlink()
+        pw.write_text("ra\n")
+        st, _ = self.rreq(port, "GET", "/api/groups", token=token)
+        self.assertEqual(st, 200)
+
+    def test_97_a_broken_symlink_arms_the_allowlist_rather_than_disabling_it(self):
+        # Path.exists() answers False for a dangling symlink AND for a symlink
+        # loop, so "operator points data/passwd at /etc/... and the target is
+        # later rotated away" used to start the server with the control OFF.
+        from internalchat.roster import Roster
+        tmp = tempfile.mkdtemp(prefix="chat-roster-link-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = chatserver.Path(tmp)
+        dangling = root / "dangling"
+        dangling.symlink_to(root / "does-not-exist")
+        loop_a, loop_b = root / "loop-a", root / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        for p in (dangling, loop_a):
+            r = Roster(p)
+            self.assertTrue(r.enforcing, f"{p.name}: allowlist silently off")
+            self.assertFalse(r.allows("anyone"), f"{p.name}: failed OPEN")
+        # a genuinely absent path is still "no allowlist" (back-compat)
+        self.assertFalse(Roster(root / "absent").enforcing)
+
+    def test_98_oversize_and_irregular_rosters_deny_without_slurping(self):
+        from internalchat.roster import Roster, MAX_ROSTER_BYTES
+        import time as _time
+        tmp = tempfile.mkdtemp(prefix="chat-roster-big-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        big = chatserver.Path(tmp) / "passwd"
+        with open(big, "wb") as f:          # sparse: size is what's checked
+            f.truncate(MAX_ROSTER_BYTES * 8)
+        r = Roster(big)
+        started = _time.monotonic()
+        self.assertFalse(r.allows("anyone"))
+        self.assertLess(_time.monotonic() - started, 2.0,
+                        "the cap must be applied from st_size, not after reading")
+        self.assertIn("larger than", r.error or "")
+        d = chatserver.Path(tmp) / "adir"    # a directory is not a roster
+        d.mkdir()
+        self.assertFalse(Roster(d).allows("anyone"))
+
+    def test_99_a_stamp_preserving_edit_is_noticed_within_the_stale_window(self):
+        # rsync -a / cp -p / install -p restore mtime, and a coarse-mtime
+        # filesystem can reuse one: the (mtime,size,ino) stamp then matches
+        # across a real REVOCATION, which is the dangerous direction to miss.
+        import internalchat.roster as rmod
+        import time as _time
+        tmp = tempfile.mkdtemp(prefix="chat-roster-stamp-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pw = chatserver.Path(tmp) / "passwd"
+        pw.write_text("ra\n")
+        r = rmod.Roster(pw)
+        self.assertTrue(r.allows("ra"))                 # primes the cache
+        st = os.stat(pw)
+        pw.write_text("rb\n")                           # same size, ra revoked
+        os.utime(pw, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(r._stat()[:2], (st.st_mtime_ns, st.st_size),
+                         "test needs a genuine stamp collision")
+        old_window = rmod.STALE_AFTER
+        rmod.STALE_AFTER = 0.2
+        self.addCleanup(setattr, rmod, "STALE_AFTER", old_window)
+        _time.sleep(0.3)
+        self.assertFalse(r.allows("ra"), "a stamp collision hid a revocation")
+
+    def test_100_approve_cannot_be_tricked_into_forging_an_entry(self):
+        from internalchat.errors import ApiError
+        tmp = tempfile.mkdtemp(prefix="chat-roster-approve-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pw = chatserver.Path(tmp) / "passwd"
+        pw.write_text("alice:Alice\n")
+        store = chatserver.Store(tmp, iters=1000)
+        r = store.roster
+        # str.splitlines() honours EIGHT terminators beyond \n; a display name
+        # carrying any of them used to inject a second, fully-approved line
+        for bad in ("Al\rmallory", "Al\u2028mallory", "Al\x85mallory",
+                    "Al\x0bmallory", "Al\x0cmallory", "Al\x1cmallory",
+                    "Al\nmallory", "Al:mallory"):
+            with self.assertRaises(ApiError, msg=repr(bad)) as cm:
+                r.approve("victim", bad)
+            self.assertEqual(cm.exception.status, 400, repr(bad))
+        self.assertNotIn("mallory", pw.read_text())
+        self.assertFalse(r.allows("mallory"))
+        # approving a name that is already listed is a no-op the parser would
+        # discard (first entry wins), so it must be refused, not "succeed"
+        pw.write_text("alice:Alice\nmole:Mole:disabled\n")
+        for who in ("alice", "mole"):
+            with self.assertRaises(ApiError) as cm:
+                r.approve(who)
+            self.assertEqual(cm.exception.status, 409, who)
+        self.assertFalse(r.allows("mole"))
+
+    def test_101_a_failed_adduser_never_leaves_the_grant_behind(self):
+        # `adduser <existing> --approve` exited 1 but had ALREADY written the
+        # roster line — silently un-revoking an account the operator had
+        # deliberately removed. A command that reports failure must not grant.
+        tmp = tempfile.mkdtemp(prefix="chat-cli-approve-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pw = chatserver.Path(tmp) / "passwd"
+        pw.write_text("staff:Staff\n")
+        chatserver.main(["adduser", "mole", "--data", tmp, "--approve",
+                         "--password", "pw-mole-1", "--no-change"])
+        self.assertTrue(chatserver.Store(tmp, iters=1000).roster.allows("mole"))
+        pw.write_text("staff:Staff\n")            # operator revokes mole
+        with self.assertRaises(SystemExit):        # account already exists
+            chatserver.main(["adduser", "mole", "--data", tmp, "--approve",
+                             "--password", "pw-mole-2", "--no-change"])
+        self.assertNotIn("mole", pw.read_text())
+        self.assertFalse(chatserver.Store(tmp, iters=1000).roster.allows("mole"))
+        with self.assertRaises(SystemExit):        # rejected password
+            chatserver.main(["adduser", "ghost", "--data", tmp, "--approve",
+                             "--password", "short"])
+        self.assertNotIn("ghost", pw.read_text())
 
 
 if __name__ == "__main__":

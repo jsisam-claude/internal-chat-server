@@ -62,8 +62,21 @@ read half-written, and a half-written roster denies until it is complete.
 
 A denied login is answered with exactly the same `401 bad credentials` as a
 wrong password, and the check runs after the password hash, so response time
-does not reveal who is on the list. Revoked users also disappear from
-`GET /api/users` and can no longer be DM'd or added to a group.
+does not reveal who is on the list.
+
+**What revocation does and does not do.** It stops the account *connecting* —
+every authenticated route, including an already-parked long-poll. It also
+removes them from `GET /api/users`, so they cannot be DM'd **by name** or
+added to a group. It deliberately does **not** rewrite history: existing
+conversations keep working for everyone else, the revoked member is still
+listed in the member roster of groups they belong to, and messages sent to
+those groups (or to an existing DM addressed by `gid`) still queue for them
+against their quota — which is what lets a re-approved account resume with
+nothing missed. If a revocation is permanent, remove the account rather than
+only the roster line.
+
+A `#` starts a comment only at the **start** of a line: `alice  # note` is a
+malformed username, and alice is then denied (fail-closed, but a footgun).
 
 ## 2. The queue — receive loop
 
