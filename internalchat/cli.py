@@ -1,4 +1,4 @@
-"""Command-line entry: `serve`, `adduser`, and `passwd` subcommands."""
+"""Command-line entry: `serve`, `adduser`, `roster`, `passwd`."""
 from __future__ import annotations
 
 import argparse
@@ -14,8 +14,19 @@ from .server import build_server
 
 DESCRIPTION = "internal-chat server (folder-queue, stdlib only, no database)"
 
+def _store(args) -> Store:
+    """One Store constructor for every subcommand, so the roster path is
+    resolved identically. An EXPLICIT --roster that isn't there is a hard
+    error: silently treating a mistyped path as "no allowlist" is exactly
+    how this control would get switched off without anyone noticing."""
+    if getattr(args, "roster", None) and not Path(args.roster).is_file():
+        raise ApiError(400, f"--roster {args.roster}: no such file (refusing "
+                            "to run with the allowlist silently disabled)")
+    return Store(args.data, roster=getattr(args, "roster", None))
+
+
 def cmd_serve(args) -> None:
-    store = Store(args.data)
+    store = _store(args)
     static_dir = Path(args.static).resolve() if args.static else None
     if not args.cert:
         log("WARNING: no --cert given, serving PLAIN HTTP — dev use only")
@@ -43,16 +54,48 @@ def _password(args, prompt: str) -> str:
 
 
 def cmd_adduser(args) -> None:
-    store = Store(args.data)
+    store = _store(args)
+    if args.approve:
+        store.roster.approve(args.user, args.display)
+        print(f"approved {args.user!r} in {store.roster.path}")
     password = _password(args, f"initial password for {args.user}: ")
-    store.add_user(args.user, password, display=args.display,
+    # the roster's display name is the operator's central one; honour it
+    # unless this command was given an explicit --display
+    display = args.display or store.roster.display(args.user)
+    store.add_user(args.user, password, display=display,
                    must_change=not args.no_change)
     print(f"user {args.user!r} created (must change password on first login: "
           f"{not args.no_change})")
 
 
+def cmd_roster(args) -> None:
+    """Show the allowlist next to the accounts, because the two drift: an
+    approved name with no account can't log in yet, and an account with no
+    entry is revoked but still holds its data."""
+    store = _store(args)
+    r = store.roster
+    if not r.enforcing:
+        print(f"no roster at {r.path} — every provisioned account may connect")
+    if r.error:
+        print(f"roster UNREADABLE ({r.error}): every user is denied")
+    entries = r.entries()
+    accounts = sorted(p.name for p in (store.root / "users").iterdir()
+                      if (p / "auth.json").is_file())
+    for name in sorted(set(entries) | set(accounts)):
+        e = entries.get(name)
+        if e is None:
+            state = "REVOKED (account only)" if r.enforcing else "account"
+        elif e.disabled:
+            state = "disabled"
+        elif name not in accounts:
+            state = "approved, no account yet"
+        else:
+            state = "ok"
+        print(f"{name:<20} {state:<24} {(e.display if e else '') or ''}")
+
+
 def cmd_passwd(args) -> None:
-    store = Store(args.data)
+    store = _store(args)
     if not store.user_exists(args.user):
         raise ApiError(404, "no such user")
     password = _password(args, f"new password for {args.user}: ")
@@ -74,20 +117,31 @@ def main(argv=None) -> None:
     sp.add_argument("--static", help="directory with the web client to serve")
     sp.add_argument("--retain-days", type=int, default=0,
                     help="archive day folders older than N days (0 = keep)")
+    sp.add_argument("--roster", help="allowlist of who may connect "
+                                     "(default: <data>/passwd, if present)")
     sp.set_defaults(func=cmd_serve)
 
     au = sub.add_parser("adduser", help="provision a user")
     au.add_argument("user")
     au.add_argument("--data", default="./data")
+    au.add_argument("--roster")
     au.add_argument("--display")
+    au.add_argument("--approve", action="store_true",
+                    help="add the user to the roster first (it must exist)")
     au.add_argument("--password", help="set non-interactively (visible in ps!)")
     au.add_argument("--no-change", action="store_true",
                     help="don't force a password change on first login")
     au.set_defaults(func=cmd_adduser)
 
+    ro = sub.add_parser("roster", help="show the allowlist and the accounts")
+    ro.add_argument("--data", default="./data")
+    ro.add_argument("--roster")
+    ro.set_defaults(func=cmd_roster)
+
     pw = sub.add_parser("passwd", help="admin password reset (kills all sessions)")
     pw.add_argument("user")
     pw.add_argument("--data", default="./data")
+    pw.add_argument("--roster")
     pw.add_argument("--password", help="set non-interactively (visible in ps!)")
     pw.add_argument("--no-change", action="store_true",
                     help="don't force a password change on next login")

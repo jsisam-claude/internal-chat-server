@@ -75,10 +75,14 @@ class Api:
         self.login_ip_limiter.check(ip)          # caps distinct-username floods
         self.login_limiter.check(f"{ip}/{user}")  # caps guessing one account
         auth = self.store.verify_password(user, password)
-        if auth is None:
+        # Checked AFTER the hash, and answered with the same 401: doing it
+        # first would return early and make "not on the roster" measurably
+        # faster than "wrong password" — an oracle for who is provisioned.
+        if auth is None or not self.store.roster.allows(user):
             raise ApiError(401, "bad credentials")
         return {"token": self.store.new_session(user), "user": user,
-                "display": auth["display"], "must_change": auth["must_change"]}
+                "display": self.store.roster.display(user) or auth["display"],
+                "must_change": auth["must_change"]}
 
     def change_password(self, user: str, body: dict, keep_token: str) -> dict:
         old, new = body.get("old", ""), body.get("new", "")
@@ -196,6 +200,13 @@ class Api:
             return self._queue_resp(items, typing)
         try:
             while True:
+                # A poll parked here was authorized up to 30s ago. Re-check
+                # the roster each pass (one stat, only while enforcing) so
+                # revoking someone cuts their live feed within ~a second
+                # instead of letting this request keep delivering to them
+                # until its deadline.
+                if not self.store.roster.allows(user):
+                    raise ApiError(401, "invalid or expired session")
                 items = self._queue_items(user)
                 cur = self._typing_for(user)
                 # return on queue activity, deadline, or a typing-state CHANGE
@@ -378,7 +389,7 @@ class Api:
         to = body.get("to")
         gid = body.get("gid")
         if isinstance(to, str) and to:
-            if not self.store.user_exists(to):
+            if not self.store.may_connect(to):
                 raise ApiError(404, "no such user")
             if to == user:
                 raise ApiError(400, "cannot message yourself")
@@ -1050,19 +1061,19 @@ class Api:
         if not (isinstance(members, list)
                 and all(isinstance(u, str) and USER_RE.match(u) for u in members)):
             raise ApiError(400, "bad members list")
-        roster = set(members) | {user}
-        if not 2 <= len(roster) <= MAX_GROUP_MEMBERS:
+        founding = set(members) | {user}
+        if not 2 <= len(founding) <= MAX_GROUP_MEMBERS:
             raise ApiError(400, f"groups need 2..{MAX_GROUP_MEMBERS} members")
-        for u in roster:
-            if not self.store.user_exists(u):
+        for u in founding:
+            if not self.store.may_connect(u):
                 raise ApiError(404, f"no such user: {u}")
-        gid = self.store.create_group(name, roster)
+        gid = self.store.create_group(name, founding)
         # announce in-band: this is how the other members' clients learn the
         # group exists at all (it lands in their queues like any message)
         self.store.spool_system(user, gid, f"{user} created “{name}”",
                                 {"event": "created", "name": name, "by": user})
         self.router.wake.set()
-        return {"gid": gid, "members": sorted(roster)}
+        return {"gid": gid, "members": sorted(founding)}
 
     def modify_members(self, user: str, gid: str, body: dict) -> dict:
         if not GID_RE.match(gid) or gid.startswith("d-"):
@@ -1077,7 +1088,7 @@ class Api:
         # validate EVERYTHING before mutating anything, so a bad `remove` can't
         # leave the `add`s (and their join announcements) half-committed
         for u in add:
-            if not (isinstance(u, str) and self.store.user_exists(u)):
+            if not (isinstance(u, str) and self.store.may_connect(u)):
                 raise ApiError(404, f"no such user: {u}")
         for u in remove:
             if u != user:
@@ -1128,11 +1139,17 @@ class Api:
     def list_users(self) -> dict:
         res = []
         for udir in sorted((self.store.root / "users").iterdir()):
+            # a revoked account still has its data on disk, but it is not a
+            # person you can start a conversation with any more
+            if not self.store.roster.allows(udir.name):
+                continue
             try:
                 auth = json.loads((udir / "auth.json").read_text())
             except (OSError, ValueError):
                 continue
-            u = {"user": udir.name, "display": auth.get("display", udir.name),
+            u = {"user": udir.name,
+                 "display": (self.store.roster.display(udir.name)
+                             or auth.get("display", udir.name)),
                  "online": self._online(udir.name)}
             seen = self._last_seen_ms(udir.name)
             if seen:

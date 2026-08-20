@@ -16,15 +16,20 @@ from pathlib import Path
 
 from .config import (GID_RE, MID_RE, USER_RE, PBKDF2_ITERS, SESSION_IDLE_DAYS)
 from .errors import ApiError
+from .roster import Roster
 from .util import now_ms, mid_date, msg_dirs_newest_first
 
 class Store:
     """All state lives under one data dir; every mutation is an atomic
     create/rename/unlink so readers never see partial state."""
 
-    def __init__(self, root, iters: int = PBKDF2_ITERS):
+    def __init__(self, root, iters: int = PBKDF2_ITERS, roster=None):
         self.root = Path(root).resolve()
         self.iters = iters
+        # The allowlist of who may connect. Defaults to <data>/passwd; absent
+        # means "not enforced", so every existing deployment keeps working
+        # exactly as before until an operator writes the file.
+        self.roster = Roster(Path(roster) if roster else self.root / "passwd")
         self._id_lock = threading.Lock()
         self._quota_lock = threading.Lock()
         for name in ("tmp", "incoming", "users", "groups", "archive", "rejected"):
@@ -208,6 +213,12 @@ class Store:
                  must_change: bool = True) -> None:
         if not USER_RE.match(user):
             raise ApiError(400, "bad username (allowed: [a-z0-9_.-]{1,32})")
+        # Provisioning an account the roster doesn't list would create
+        # something that can never log in; refuse instead of leaving a
+        # confusing half-provisioned name behind.
+        if not self.roster.allows(user):
+            raise ApiError(403, f"{user!r} is not on the roster "
+                                f"({self.roster.path}) — add it there first")
         d = self.user_dir(user)
         if d.exists():
             raise ApiError(409, "user exists")
@@ -235,7 +246,18 @@ class Store:
             raise ApiError(503, "user create failed, please retry")
 
     def user_exists(self, user: str) -> bool:
+        """Has an ACCOUNT. Deliberately says nothing about the roster: admin
+        paths (passwd reset, bouncing a message back to its sender) act on
+        accounts, whether or not the operator has since revoked them."""
         return bool(USER_RE.match(user)) and (self.user_dir(user) / "auth.json").is_file()
+
+    def may_connect(self, user: str) -> bool:
+        """Has an account AND is allowed by the roster — i.e. someone who can
+        actually be a party to a conversation. This is the predicate every
+        "is that a real user?" check in the API wants; revoked accounts must
+        not be DM-able or addable to groups, because nothing they are sent
+        can ever be read."""
+        return self.user_exists(user) and self.roster.allows(user)
 
     def verify_password(self, user: str, password: str) -> dict | None:
         try:
@@ -267,6 +289,14 @@ class Store:
     def session_user(self, token: str) -> str | None:
         user, sep, _ = token.partition(":")
         if not sep or not USER_RE.match(user):
+            return None
+        # Revocation has to reach ALREADY-ISSUED tokens, or removing someone
+        # from the roster wouldn't remove them from the server — it would
+        # only stop them logging in again. Checked before the session marker
+        # is touched, so a revoked token's mtime is never refreshed either.
+        # The marker is NOT deleted: a transiently unreadable roster denies
+        # (fail closed) but must not log everybody out permanently.
+        if not self.roster.allows(user):
             return None
         p = (self.user_dir(user) / "sessions" /
              hashlib.sha256(token.encode()).hexdigest())

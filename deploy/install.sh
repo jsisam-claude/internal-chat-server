@@ -6,6 +6,7 @@
 #   /opt/internal-chat/chatserver.py       code (root-owned, read-only)
 #   /opt/internal-chat/static/             web client (optional argument)
 #   /etc/internal-chat/server.pem          TLS cert+key (self-signed if absent)
+#   /etc/internal-chat/passwd              optional allowlist (see --roster)
 #   /var/lib/internal-chat/                data dir (service-owned)
 #
 # Recommended but not automated here: mount /var/lib/internal-chat from a
@@ -63,6 +64,17 @@ fi
 chmod 0600 "$ETC/server.pem"
 chown "$SVCUSER:$SVCUSER" "$ETC/server.pem" "$DATA"
 chmod 0700 "$DATA"
+
+# Optional allowlist of who may connect. Root-owned and read-only to the
+# service ON PURPOSE: the data dir is the one place the chat process can
+# write, so a roster kept there could be rewritten by the process itself.
+# /etc is read-only to the unit (ProtectSystem=strict), so keep it here and
+# point the unit at it with --roster.
+if [ -f "$ETC/passwd" ]; then
+    chown root:root "$ETC/passwd"
+    chmod 0644 "$ETC/passwd"
+    echo "roster present: add '--roster $ETC/passwd' to the unit's ExecStart"
+fi
 
 if [ -d /run/systemd/system ]; then  # systemd present AND running
     install -m 0644 deploy/internal-chat.service /etc/systemd/system/

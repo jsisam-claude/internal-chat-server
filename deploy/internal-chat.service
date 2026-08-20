@@ -6,6 +6,11 @@ Wants=network-online.target
 [Service]
 User=internal-chat
 Group=internal-chat
+# To enforce the passwd-style allowlist, create /etc/internal-chat/passwd
+# (root-owned; the service must not be able to edit its own roster) and add
+#     --roster /etc/internal-chat/passwd \
+# to the ExecStart below. Absent = no allowlist; an unreadable one denies
+# every user, so the path is deliberately NOT set by default.
 ExecStart=/usr/bin/python3 /opt/internal-chat/chatserver.py serve \
     --data /var/lib/internal-chat \
     --cert /etc/internal-chat/server.pem \

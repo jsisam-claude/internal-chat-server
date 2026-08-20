@@ -2037,5 +2037,255 @@ class ChatServerTest(unittest.TestCase):
         self.assertFalse((staged / (up2["file_id"] + ".thumb")).exists())
 
 
+    # ---- the passwd-style roster: only pre-approved users may connect ------
+
+    def roster_server(self, roster_text=None, users=("ra", "rb", "rc", "rd")):
+        """An isolated server (the class fixture must stay allowlist-free).
+        Accounts are provisioned BEFORE the roster file exists, so a test can
+        describe an account the roster then revokes — and so add_user's own
+        roster check isn't what's under test here."""
+        tmp = tempfile.mkdtemp(prefix="chat-roster-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        boot = chatserver.Store(tmp, iters=1000)
+        for u in users:
+            boot.add_user(u, "pw-" + u, must_change=False)
+        pw = chatserver.Path(tmp) / "passwd"
+        if roster_text is not None:
+            pw.write_text(roster_text)
+        store = chatserver.Store(tmp, iters=1000)   # arms enforcement, or not
+        httpd, router, api = chatserver.build_server(store, "127.0.0.1", 0)
+        api.login_ip_limiter.limit = 1_000_000
+        api.login_limiter.limit = 1_000_000
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(router.stopping.set)
+        return store, httpd.server_address[1], pw
+
+    @staticmethod
+    def rreq(port, method, path, token=None, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        hdrs = {}
+        if token:
+            hdrs["Authorization"] = "Bearer " + token
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            hdrs["Content-Type"] = "application/json"
+        conn.request(method, path, data, hdrs)
+        r = conn.getresponse()
+        payload = r.read()
+        conn.close()
+        return r.status, (json.loads(payload) if payload else None)
+
+    def rlogin(self, port, user):
+        return self.rreq(port, "POST", "/api/login",
+                         body={"user": user, "password": "pw-" + user})
+
+    def test_88_roster_gates_login_and_live_sessions(self):
+        store, port, pw = self.roster_server("# who may connect\nra:Ray A\n")
+        st, body = self.rlogin(port, "ra")
+        self.assertEqual(st, 200, body)
+        self.assertEqual(body["display"], "Ray A")   # roster display wins
+        token = body["token"]
+        # rb's password is correct and the account is fine — it is simply not
+        # approved, and the answer is byte-identical to a wrong password
+        st, denied = self.rlogin(port, "rb")
+        self.assertEqual(st, 401)
+        self.assertEqual(denied["error"], "bad credentials")
+        st, _ = self.rreq(port, "GET", "/api/groups", token=token)
+        self.assertEqual(st, 200)
+        # REVOCATION REACHES A LIVE SESSION: removing the line must log ra
+        # out of an already-issued token, not merely stop the next login
+        pw.write_text("# everyone revoked\n")
+        st, _ = self.rreq(port, "GET", "/api/groups", token=token)
+        self.assertEqual(st, 401)
+        # ...and the session marker is kept, so re-approving restores access
+        # without forcing a fresh login (a transient denial isn't destructive)
+        pw.write_text("ra\n")
+        st, _ = self.rreq(port, "GET", "/api/groups", token=token)
+        self.assertEqual(st, 200)
+
+    def test_89_roster_parsing_edges(self):
+        store, port, pw = self.roster_server(
+            "\n"
+            "# a comment\n"
+            "   \n"
+            "  ra : Ray Anderson \n"      # surrounding whitespace tolerated
+            "rb:Bee B:disabled\n"         # record kept, account blocked
+            "rc:See C:disbaled\n"         # TYPO'd flag must fail CLOSED
+            "NOT A NAME:x\n"              # invalid username, ignored
+            "rd:First\n"
+            "rd:Second\n")                # duplicate: first wins
+        r = store.roster
+        self.assertTrue(r.enforcing)
+        self.assertTrue(r.allows("ra"))
+        self.assertEqual(r.display("ra"), "Ray Anderson")
+        self.assertFalse(r.allows("rb"))     # disabled
+        self.assertFalse(r.allows("rc"))     # unknown flag -> denied, not allowed
+        self.assertTrue(r.allows("rd"))
+        self.assertEqual(r.display("rd"), "First")
+        self.assertFalse(r.allows("nobody"))
+        for user, want in (("ra", 200), ("rb", 401), ("rc", 401), ("rd", 200)):
+            st, _ = self.rlogin(port, user)
+            self.assertEqual(st, want, user)
+
+    def test_90_unreadable_roster_denies_everyone(self):
+        store, port, pw = self.roster_server("ra\n")
+        st, body = self.rlogin(port, "ra")
+        self.assertEqual(st, 200)
+        token = body["token"]
+        sessions = store.user_dir("ra") / "sessions"
+        # a corrupt roster is NOT evidence that everyone is allowed
+        pw.write_bytes(b"ra\n\xff\xfe not utf-8\n")
+        st, _ = self.rreq(port, "GET", "/api/groups", token=token)
+        self.assertEqual(st, 401)
+        self.assertEqual(len(list(sessions.iterdir())), 1)  # marker kept
+        # nor is deleting it: `rm passwd` must not switch the control off
+        pw.unlink()
+        st, _ = self.rreq(port, "GET", "/api/groups", token=token)
+        self.assertEqual(st, 401)
+        st, _ = self.rlogin(port, "ra")
+        self.assertEqual(st, 401)
+        pw.write_text("ra\n")                    # restored -> access returns
+        st, _ = self.rreq(port, "GET", "/api/groups", token=token)
+        self.assertEqual(st, 200)
+
+    def test_91_enforcement_is_pinned_at_startup(self):
+        # started with no roster: the allowlist is OFF for this process, and
+        # writing the file later must not silently arm it mid-flight (that
+        # would lock out every account not yet listed)
+        store, port, pw = self.roster_server(None)
+        self.assertFalse(store.roster.enforcing)
+        for user in ("ra", "rb"):
+            st, _ = self.rlogin(port, user)
+            self.assertEqual(st, 200)
+        pw.write_text("ra\n")
+        st, _ = self.rlogin(port, "rb")
+        self.assertEqual(st, 200, "arming needs a restart, by design")
+        # a fresh Store over the same dir DOES pick it up
+        self.assertTrue(chatserver.Store(store.root, iters=1000).roster.enforcing)
+
+    def test_92_revoked_user_is_not_addressable(self):
+        store, port, pw = self.roster_server("ra\nrb\n")
+        _, a = self.rlogin(port, "ra")
+        ta = a["token"]
+        st, users = self.rreq(port, "GET", "/api/users", token=ta)
+        self.assertEqual(sorted(u["user"] for u in users["users"]), ["ra", "rb"])
+        pw.write_text("ra\n")               # rb revoked
+        st, users = self.rreq(port, "GET", "/api/users", token=ta)
+        self.assertEqual([u["user"] for u in users["users"]], ["ra"])
+        # nothing sent to a revoked account could ever be read, so refuse it
+        st, _ = self.rreq(port, "POST", "/api/messages", token=ta,
+                          body={"to": "rb", "text": "hi",
+                                "nonce": "nonce-revoked-1"})
+        self.assertEqual(st, 404)
+        st, _ = self.rreq(port, "POST", "/api/groups", token=ta,
+                          body={"name": "g", "members": ["rb"]})
+        self.assertEqual(st, 404)
+        st, g = self.rreq(port, "POST", "/api/groups", token=ta,
+                          body={"name": "g", "members": ["rc"]})
+        self.assertEqual(st, 404)           # rc has an account but no entry
+        # provisioning an account that could never log in is refused too
+        with self.assertRaises(chatserver.ApiError) as cm:
+            store.add_user("newbie", "pw-newbie")
+        self.assertEqual(cm.exception.status, 403)
+
+    def test_93_cli_roster_flow(self):
+        tmp = tempfile.mkdtemp(prefix="chat-cli-roster-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pw = chatserver.Path(tmp) / "passwd"
+        pw.write_text("listed:Listed User\n")
+        # an approved name provisions, and takes the roster's display name
+        chatserver.main(["adduser", "listed", "--data", tmp,
+                         "--password", "pw-listed", "--no-change"])
+        store = chatserver.Store(tmp, iters=1000)
+        auth = json.loads((store.user_dir("listed") / "auth.json").read_text())
+        self.assertEqual(auth["display"], "Listed User")
+        # an unlisted one is refused...
+        with self.assertRaises(SystemExit):
+            chatserver.main(["adduser", "walkin", "--data", tmp,
+                             "--password", "pw-walkin"])
+        self.assertFalse((store.user_dir("walkin")).exists())
+        # ...unless the operator approves it in the same breath
+        chatserver.main(["adduser", "walkin", "--data", tmp, "--approve",
+                         "--display", "Walk In", "--password", "pw-walkin",
+                         "--no-change"])
+        self.assertIn("walkin:Walk In", pw.read_text())
+        self.assertTrue(chatserver.Store(tmp, iters=1000).roster.allows("walkin"))
+        # a mistyped --roster must NOT be read as "no allowlist"
+        with self.assertRaises(SystemExit):
+            chatserver.main(["roster", "--data", tmp,
+                             "--roster", os.path.join(tmp, "nope")])
+        chatserver.main(["roster", "--data", tmp])   # prints, must not raise
+
+    def test_94_revocation_interrupts_a_parked_long_poll(self):
+        # a poll parked for 30s was authorized when it started; revoking must
+        # cut the live feed promptly, not when its deadline happens to expire
+        import time as _time
+        store, port, pw = self.roster_server("ra\n")
+        _, a = self.rlogin(port, "ra")
+        token = a["token"]
+        out = {}
+
+        def poll():
+            out["r"] = self.rreq(port, "GET", "/api/messages?wait=25",
+                                 token=token)
+        t = threading.Thread(target=poll)
+        t.start()
+        _time.sleep(0.5)                 # let it park
+        pw.write_text("# revoked\n")
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "parked poll ignored the revocation")
+        self.assertEqual(out["r"][0], 401)
+
+    def test_95_roster_reload_under_concurrent_rewrite(self):
+        """Hammer the auth paths while the file is rewritten underneath them.
+        The invariant that must never bend: a user who is not in ANY version
+        of the file never gets a 200 — a half-read or mid-swap roster has to
+        deny, never guess."""
+        import time as _time
+        store, port, pw = self.roster_server("ra\n")
+        toks = {}
+        for u in ("ra", "rc"):
+            # rc is briefly listed only to obtain a token, then never again
+            pw.write_text("ra\nrc\n")
+            st, b = self.rlogin(port, u)
+            self.assertEqual(st, 200, b)
+            toks[u] = b["token"]
+        pw.write_text("ra\n")
+        stop = threading.Event()
+        seen = {"ra": set(), "rc": set()}
+        errors = []
+
+        def hammer(user):
+            try:
+                while not stop.is_set():
+                    st, _ = self.rreq(port, "GET", "/api/groups",
+                                      token=toks[user])
+                    seen[user].add(st)
+            except Exception as e:      # a connection error is a failure too
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=hammer, args=(u,))
+                   for u in ("ra", "ra", "rc", "rc")]
+        for t in threads:
+            t.start()
+        # rewrite ATOMICALLY (tmp + rename), the way an editor does: a reader
+        # then sees one whole version or the other, never a torn file
+        tmp = pw.with_suffix(".tmp")
+        for i in range(60):
+            tmp.write_text("ra:Ray\n" if i % 2 else "ra:Ray\n# churn\n")
+            os.replace(tmp, pw)
+            _time.sleep(0.005)
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(seen["rc"], {401}, "an unlisted user was let in")
+        self.assertIn(200, seen["ra"], "the listed user was never served")
+        self.assertNotIn(500, seen["ra"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

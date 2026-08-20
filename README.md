@@ -23,7 +23,8 @@ internalchat/
 ├── router.py          Router (routes + fans out messages) + Janitor (retention)
 ├── api.py             Api — all request-handling logic, HTTP-independent
 ├── server.py          the HTTP handler + build_server() wiring
-└── cli.py             serve / adduser / passwd command line
+├── roster.py          passwd-style allowlist of who may connect
+└── cli.py             serve / adduser / roster / passwd command line
 ```
 
 Data flows one way: `server.py` parses a request → calls an `api.py` method →
@@ -40,6 +41,10 @@ python3 chatserver.py adduser bob   --data /var/lib/internal-chat
 
 # lost password: admin reset (forces a change, kills all sessions)
 python3 chatserver.py passwd alice  --data /var/lib/internal-chat
+
+# only pre-approved users may connect (optional; absent = no allowlist)
+printf 'alice:Alice Anderson\nbob:Bob Brown\n' > /var/lib/internal-chat/passwd
+python3 chatserver.py roster --data /var/lib/internal-chat   # roster vs accounts
 
 # TLS cert (internal CA or self-signed; clients pin it)
 openssl req -x509 -newkey rsa:2048 -nodes -days 825 \

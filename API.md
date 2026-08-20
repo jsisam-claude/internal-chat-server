@@ -27,6 +27,44 @@ send failures, and group lifecycle all arrive there; every other GET is for
 Login is rate-limited per IP+user (10 / 5 min → 429). If `must_change` is
 true, the client must show the password-change screen before anything else.
 
+### The roster — who may connect
+
+An optional passwd-style allowlist at **`<data>/passwd`** (override with
+`--roster PATH`) decides who may hold an account at all:
+
+```
+# who is allowed to use the chat server
+alice:Alice Anderson
+bob:Bob Brown
+carol:Carol Clark:disabled
+```
+
+`user[:display[:flags]]`; blank lines and `#` comments are ignored, `display`
+overrides the account's own name, and the only flag is `disabled` (keeps the
+record, blocks the account). It holds **no secrets** — passwords stay in each
+account's `auth.json` — so it can be reviewed, diffed, or generated from
+whatever the org already uses to answer "who works here".
+
+* **Absent** (the default) → not enforced; every provisioned account works,
+  exactly as before this existed.
+* **Present at startup** → enforced for the life of the process. Removing an
+  entry denies that user **immediately, including sessions already logged
+  in** (a parked long-poll is cut within ~1s) — their session markers are
+  kept, so re-adding the line restores access without a fresh login.
+* Enforcement is armed **once, at startup**, but the file's *contents* are
+  re-read on change: `rm passwd` does not switch the control off, and a
+  roster that cannot be read (unparseable, non-UTF-8, oversized, deleted)
+  denies **everyone** rather than falling back to open.
+
+Edit it **atomically** — write a temp file and `rename` it into place, which
+is what editors do. A truncate-in-place rewrite (`echo … > passwd`) can be
+read half-written, and a half-written roster denies until it is complete.
+
+A denied login is answered with exactly the same `401 bad credentials` as a
+wrong password, and the check runs after the password hash, so response time
+does not reveal who is on the list. Revoked users also disappear from
+`GET /api/users` and can no longer be DM'd or added to a group.
+
 ## 2. The queue — receive loop
 
 ### `GET /api/messages?wait=25`
