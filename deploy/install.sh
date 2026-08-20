@@ -38,6 +38,16 @@ if [ -n "$WEB" ]; then
     mkdir -p "$APP/static"
     # copy only what the client needs; never dotfiles or repo metadata
     cp "$WEB"/index.html "$WEB"/app.css "$WEB"/favicon.svg "$APP/static/"
+    # PWA install assets: without these the manifest and apple-touch-icon
+    # 404 on a real deployment (the browser then refuses to install the app).
+    # Guarded so an older web checkout that predates them still installs.
+    if [ -f "$WEB/manifest.json" ]; then
+        cp "$WEB/manifest.json" "$APP/static/"
+    fi
+    if [ -d "$WEB/icons" ]; then
+        mkdir -p "$APP/static/icons"
+        cp "$WEB"/icons/*.png "$APP/static/icons/"
+    fi
     mkdir -p "$APP/static/js"
     cp "$WEB"/js/*.js "$APP/static/js/"
 fi
