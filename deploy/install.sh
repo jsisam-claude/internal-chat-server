@@ -6,7 +6,7 @@
 #   /opt/internal-chat/chatserver.py       code (root-owned, read-only)
 #   /opt/internal-chat/static/             web client (optional argument)
 #   /etc/internal-chat/server.pem          TLS cert+key (self-signed if absent)
-#   /etc/internal-chat/passwd              optional allowlist (see --roster)
+#   $DATA/passwd                           THE user file (created by adduser)
 #   /var/lib/internal-chat/                data dir (service-owned)
 #
 # Recommended but not automated here: mount /var/lib/internal-chat from a
@@ -65,15 +65,14 @@ chmod 0600 "$ETC/server.pem"
 chown "$SVCUSER:$SVCUSER" "$ETC/server.pem" "$DATA"
 chmod 0700 "$DATA"
 
-# Optional allowlist of who may connect. Root-owned and read-only to the
-# service ON PURPOSE: the data dir is the one place the chat process can
-# write, so a roster kept there could be rewritten by the process itself.
-# /etc is read-only to the unit (ProtectSystem=strict), so keep it here and
-# point the unit at it with --roster.
-if [ -f "$ETC/passwd" ]; then
-    chown root:root "$ETC/passwd"
-    chmod 0644 "$ETC/passwd"
-    echo "roster present: add '--roster $ETC/passwd' to the unit's ExecStart"
+# The user file lives in the data dir and is rewritten by the server when a
+# user changes their password, so it stays service-owned and private (it
+# holds password hashes). Hardening option: move it somewhere the service
+# can only READ (--roster /etc/internal-chat/passwd, root-owned) — logins
+# keep working and self-service password changes answer 503.
+if [ -f "$DATA/passwd" ]; then
+    chown "$SVCUSER:$SVCUSER" "$DATA/passwd"
+    chmod 0600 "$DATA/passwd"
 fi
 
 if [ -d /run/systemd/system ]; then  # systemd present AND running

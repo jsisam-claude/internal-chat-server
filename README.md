@@ -23,8 +23,8 @@ internalchat/
 ├── router.py          Router (routes + fans out messages) + Janitor (retention)
 ├── api.py             Api — all request-handling logic, HTTP-independent
 ├── server.py          the HTTP handler + build_server() wiring
-├── roster.py          passwd-style allowlist of who may connect
-└── cli.py             serve / adduser / roster / passwd command line
+├── roster.py          THE user file: identity, flags, password (last field)
+└── cli.py             serve / adduser / passwd / roster / hashpw / export-passwd
 ```
 
 Data flows one way: `server.py` parses a request → calls an `api.py` method →
@@ -36,15 +36,17 @@ public names, so `import chatserver` keeps working.
 
 ```bash
 # provision users (they must change the password on first login)
+# each adduser appends ONE line to <data>/passwd — that's all provisioning
+# is; the account's folders appear by themselves on first login/first message
 python3 chatserver.py adduser alice --data /var/lib/internal-chat
 python3 chatserver.py adduser bob   --data /var/lib/internal-chat
 
 # lost password: admin reset (forces a change, kills all sessions)
 python3 chatserver.py passwd alice  --data /var/lib/internal-chat
 
-# only pre-approved users may connect (optional; absent = no allowlist)
-printf 'alice:Alice Anderson\nbob:Bob Brown\n' > /var/lib/internal-chat/passwd
-python3 chatserver.py roster --data /var/lib/internal-chat   # roster vs accounts
+# the file IS the user database (password hash last field); manage it by
+# hand if you prefer: chatserver.py hashpw prints a spec to paste
+python3 chatserver.py roster --data /var/lib/internal-chat   # list users/state
 
 # TLS cert (internal CA or self-signed; clients pin it)
 openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
@@ -85,7 +87,7 @@ data/
 ├── users/<u>/queue/                # symlinks: new messages + flag events
 │                                   #   (~d~ delivered, ~r~ read, ~x~ bounced,
 │                                   #    ~a~ reaction, ~u~ edited/deleted)
-├── users/<u>/{staged,nonces,sessions,starred,auth.json}
+├── users/<u>/{staged,nonces,sessions,starred}   # auto-provisioned on first contact
 ├── groups/<gid>/members/<u>        # roster = marker files
 ├── groups/<gid>/<date>/<msg-id>/   # message.txt, from, attachments/,
 │                                   # deliveredto/<u>, readby/<u>,

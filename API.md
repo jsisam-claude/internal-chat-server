@@ -27,56 +27,66 @@ send failures, and group lifecycle all arrive there; every other GET is for
 Login is rate-limited per IP+user (10 / 5 min → 429). If `must_change` is
 true, the client must show the password-change screen before anything else.
 
-### The roster — who may connect
+### The user file — identity, flags, password
 
-An optional passwd-style allowlist at **`<data>/passwd`** (override with
-`--roster PATH`) decides who may hold an account at all:
+**One passwd-style file is the entire user database**: `<data>/passwd`
+(override with `--roster PATH`). One line per user, properties in order,
+the password hash as the LAST field — pre-shadow `/etc/passwd`, honestly:
 
 ```
-# who is allowed to use the chat server
-alice:Alice Anderson
-bob:Bob Brown
-carol:Carol Clark:disabled
+# user[:display[:flags[:password]]]
+alice:Alice Anderson::pbkdf2-sha256$600000$<salt-hex>$<hash-hex>
+bob:Bob Brown:must-change:pbkdf2-sha256$600000$...$...
+carol:Carol Clark:disabled:pbkdf2-sha256$600000$...$...
 ```
 
-`user[:display[:flags]]`; blank lines and `#` comments are ignored, `display`
-overrides the account's own name, and the only flag is `disabled` (keeps the
-record, blocks the account). It holds **no secrets** — passwords stay in each
-account's `auth.json` — so it can be reviewed, diffed, or generated from
-whatever the org already uses to answer "who works here".
+Blank lines and `#` comments are ignored (a `#` only starts a comment at the
+START of a line). `flags` is comma-separated: `disabled` blocks the account
+while keeping the record; `must-change` forces a password change at next
+login and is cleared automatically when the user changes it. A line with no
+password parses but can never log in (stage a name before issuing a
+credential). Hash specs are self-describing (`pbkdf2-sha256$iters$salt$hash`),
+so iteration counts can be raised without breaking existing lines. Generate
+one with `chatserver.py hashpw`, or add whole lines with
+`chatserver.py adduser`.
 
-* **Absent** (the default) → not enforced; every provisioned account works,
-  exactly as before this existed.
-* **Present at startup** → enforced for the life of the process. Removing an
-  entry denies that user **immediately, including sessions already logged
-  in** (a parked long-poll is cut within ~1s) — their session markers are
-  kept, so re-adding the line restores access without a fresh login.
-* Enforcement is armed **once, at startup**, but the file's *contents* are
-  re-read on change: `rm passwd` does not switch the control off, and a
-  roster that cannot be read (unparseable, non-UTF-8, oversized, deleted)
-  denies **everyone** rather than falling back to open.
+**There is no other provisioning step.** An account's directory tree
+(queue, sessions, staged uploads) is created automatically on *first
+contact*: the first successful login, or the first message routed to the
+user. Everyone listed appears in `GET /api/users` immediately — DM-able
+from day zero, their queue materialising with the first message.
 
-Edit it **atomically** — write a temp file and `rename` it into place, which
-is what editors do. A truncate-in-place rewrite (`echo … > passwd`) can be
-read half-written, and a half-written roster denies until it is complete.
+* The file is **authoritative and hot-reloaded**: add a line and the user
+  can log in on the next request; remove it and they are cut off within
+  ~1s, **including sessions already logged in** (a parked long-poll is cut
+  too). Session markers are kept on denial, so restoring the line restores
+  access without a fresh login. No file means **no users**.
+* Every unreadable state — FIFO, directory, symlink loop, non-UTF-8,
+  oversized, unknown flag on a line — **denies** rather than guesses. A
+  user database that cannot be read is not evidence that anyone is allowed.
+* A denied login answers with the same `401 bad credentials` as a wrong
+  password, with **flat timing** across every failure shape (unknown name,
+  password-less entry, malformed hash, wrong password, disabled — the
+  disabled check runs *after* the hash).
+* The server **rewrites the file** when a user changes their password
+  (`POST /api/password`): exactly one line changes, atomically, under
+  `<path>.lock`; comments and other lines survive byte-for-byte. A file the
+  service cannot write is a valid hardening stance — logins keep working
+  and self-service changes answer `503`. Since the file now holds hashes,
+  keep it `0600` (the CLI creates it that way). Edit it **atomically**
+  (write a temp file and `rename`) — a truncate-in-place rewrite can be
+  read half-written, which denies until it completes.
 
-A denied login is answered with exactly the same `401 bad credentials` as a
-wrong password, and the check runs after the password hash, so response time
-does not reveal who is on the list.
+**What removal does and does not do.** It stops the account *connecting*
+and hides it from the directory, so it cannot be DM'd by name or added to
+groups. It deliberately does **not** rewrite history: existing groups still
+list the member, and messages to those groups still queue for them — which
+is what lets a restored line resume with nothing missed. If removal is
+permanent, delete the account's directory too.
 
-**What revocation does and does not do.** It stops the account *connecting* —
-every authenticated route, including an already-parked long-poll. It also
-removes them from `GET /api/users`, so they cannot be DM'd **by name** or
-added to a group. It deliberately does **not** rewrite history: existing
-conversations keep working for everyone else, the revoked member is still
-listed in the member roster of groups they belong to, and messages sent to
-those groups (or to an existing DM addressed by `gid`) still queue for them
-against their quota — which is what lets a re-approved account resume with
-nothing missed. If a revocation is permanent, remove the account rather than
-only the roster line.
-
-A `#` starts a comment only at the **start** of a line: `alice  # note` is a
-malformed username, and alice is then denied (fail-closed, but a footgun).
+**Migrating** from the legacy per-account `auth.json` layout:
+`chatserver.py export-passwd --data D >> D/passwd` — existing hashes are
+preserved, so nobody's password changes.
 
 ## 2. The queue — receive loop
 

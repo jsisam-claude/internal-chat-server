@@ -74,15 +74,17 @@ class Api:
             raise ApiError(400, "bad credentials")
         self.login_ip_limiter.check(ip)          # caps distinct-username floods
         self.login_limiter.check(f"{ip}/{user}")  # caps guessing one account
-        auth = self.store.verify_password(user, password)
-        # Checked AFTER the hash, and answered with the same 401: doing it
-        # first would return early and make "not on the roster" measurably
-        # faster than "wrong password" — an oracle for who is provisioned.
-        if auth is None or not self.store.roster.allows(user):
+        # One lookup answers everything: verify_password returns the user
+        # file's entry only when the hash matches AND the entry isn't
+        # disabled — with flat timing across every failure shape, so the
+        # response can't reveal who is listed. new_session() provisions the
+        # account's directory on this, its first contact.
+        e = self.store.verify_password(user, password)
+        if e is None:
             raise ApiError(401, "bad credentials")
         return {"token": self.store.new_session(user), "user": user,
-                "display": self.store.roster.display(user) or auth["display"],
-                "must_change": auth["must_change"]}
+                "display": e.display or user,
+                "must_change": e.must_change}
 
     def change_password(self, user: str, body: dict, keep_token: str) -> dict:
         old, new = body.get("old", ""), body.get("new", "")
@@ -201,7 +203,7 @@ class Api:
         try:
             while True:
                 # A poll parked here was authorized up to 30s ago. Re-check
-                # the roster each pass (one stat, only while enforcing) so
+                # the user file each pass (one stat) so
                 # revoking someone cuts their live feed within ~a second
                 # instead of letting this request keep delivering to them
                 # until its deadline.
@@ -1138,20 +1140,18 @@ class Api:
 
     def list_users(self) -> dict:
         res = []
-        for udir in sorted((self.store.root / "users").iterdir()):
-            # a revoked account still has its data on disk, but it is not a
-            # person you can start a conversation with any more
-            if not self.store.roster.allows(udir.name):
+        # The FILE is the directory: everyone listed (and not disabled)
+        # appears — including colleagues who have never logged in, who are
+        # thereby DM-able from day zero (their queue is provisioned by the
+        # first message routed to them). Accounts whose line was removed
+        # vanish here even though their data is still on disk.
+        for name, e in sorted(self.store.roster.entries().items()):
+            if e.disabled:
                 continue
-            try:
-                auth = json.loads((udir / "auth.json").read_text())
-            except (OSError, ValueError):
-                continue
-            u = {"user": udir.name,
-                 "display": (self.store.roster.display(udir.name)
-                             or auth.get("display", udir.name)),
-                 "online": self._online(udir.name)}
-            seen = self._last_seen_ms(udir.name)
+            u = {"user": name,
+                 "display": e.display or name,
+                 "online": self._online(name)}
+            seen = self._last_seen_ms(name)
             if seen:
                 u["last_seen"] = seen
             res.append(u)

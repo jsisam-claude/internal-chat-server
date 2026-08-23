@@ -2037,30 +2037,30 @@ class ChatServerTest(unittest.TestCase):
         self.assertFalse((staged / (up2["file_id"] + ".thumb")).exists())
 
 
-    # ---- the passwd-style roster: only pre-approved users may connect ------
+    # ---- the user file: identity, flags, password — one line per user ----
 
-    def roster_server(self, roster_text=None, users=("ra", "rb", "rc", "rd")):
-        """An isolated server (the class fixture must stay allowlist-free).
-        Accounts are provisioned BEFORE the roster file exists, so a test can
-        describe an account the roster then revokes — and so add_user's own
-        roster check isn't what's under test here."""
+    @staticmethod
+    def pwline(user, display="", flags="", password=None):
+        """One canonical user-file line, password hashed as the last field."""
+        from internalchat.roster import make_hash
+        spec = make_hash(password or ("pw-" + user), 1000)
+        return f"{user}:{display}:{flags}:{spec}"
+
+    def roster_server(self, text):
+        """An isolated server over a user file (None = the file is absent)."""
         tmp = tempfile.mkdtemp(prefix="chat-roster-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        boot = chatserver.Store(tmp, iters=1000)
-        for u in users:
-            boot.add_user(u, "pw-" + u, must_change=False)
         pw = chatserver.Path(tmp) / "passwd"
-        if roster_text is not None:
-            pw.write_text(roster_text)
-        store = chatserver.Store(tmp, iters=1000)   # arms enforcement, or not
+        if text is not None:
+            pw.write_text(text)
+        store = chatserver.Store(tmp, iters=1000)
         httpd, router, api = chatserver.build_server(store, "127.0.0.1", 0)
         api.login_ip_limiter.limit = 1_000_000
         api.login_limiter.limit = 1_000_000
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        # cleanups run LIFO, so register them in reverse of the order they must
-        # happen: stop the router and WAIT for it before the tree disappears,
-        # or its drain loop raises FileNotFoundError into the test output and
-        # a genuine router crash becomes indistinguishable from teardown litter
+        # cleanups run LIFO: stop the router and WAIT for it before the tree
+        # disappears, or its drain loop raises into the test output and a
+        # genuine router crash becomes indistinguishable from teardown litter
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
         self.addCleanup(router.join, 5)
@@ -2084,18 +2084,24 @@ class ChatServerTest(unittest.TestCase):
         conn.close()
         return r.status, (json.loads(payload) if payload else None)
 
-    def rlogin(self, port, user):
+    def rlogin(self, port, user, password=None):
         return self.rreq(port, "POST", "/api/login",
-                         body={"user": user, "password": "pw-" + user})
+                         body={"user": user,
+                               "password": password or ("pw-" + user)})
 
-    def test_88_roster_gates_login_and_live_sessions(self):
-        store, port, pw = self.roster_server("# who may connect\nra:Ray A\n")
+    def test_88_the_file_is_the_user_db_and_revocation_reaches_live_sessions(self):
+        ra = self.pwline("ra", "Ray A")
+        store, port, pw = self.roster_server("# staff\n" + ra + "\n")
+        # no manual provisioning happened: the directory does not exist yet
+        self.assertFalse(store.user_dir("ra").exists())
         st, body = self.rlogin(port, "ra")
         self.assertEqual(st, 200, body)
-        self.assertEqual(body["display"], "Ray A")   # roster display wins
+        self.assertEqual(body["display"], "Ray A")
         token = body["token"]
-        # rb's password is correct and the account is fine — it is simply not
-        # approved, and the answer is byte-identical to a wrong password
+        # ...and first contact provisioned it
+        self.assertTrue((store.user_dir("ra") / "queue").is_dir())
+        # rb is simply not in the file; the answer is byte-identical to a
+        # wrong password
         st, denied = self.rlogin(port, "rb")
         self.assertEqual(st, 401)
         self.assertEqual(denied["error"], "bad credentials")
@@ -2106,82 +2112,107 @@ class ChatServerTest(unittest.TestCase):
         pw.write_text("# everyone revoked\n")
         st, _ = self.rreq(port, "GET", "/api/groups", token=token)
         self.assertEqual(st, 401)
-        # ...and the session marker is kept, so re-approving restores access
-        # without forcing a fresh login (a transient denial isn't destructive)
-        pw.write_text("ra\n")
+        # the session marker is kept, so restoring the LINE (same hash)
+        # restores access without a fresh login
+        pw.write_text(ra + "\n")
         st, _ = self.rreq(port, "GET", "/api/groups", token=token)
         self.assertEqual(st, 200)
 
-    def test_89_roster_parsing_edges(self):
-        store, port, pw = self.roster_server(
-            "\n"
-            "# a comment\n"
-            "   \n"
-            "  ra : Ray Anderson \n"      # surrounding whitespace tolerated
-            "rb:Bee B:disabled\n"         # record kept, account blocked
-            "rc:See C:disbaled\n"         # TYPO'd flag must fail CLOSED
-            "NOT A NAME:x\n"              # invalid username, ignored
-            "rd:First\n"
-            "rd:Second\n")                # duplicate: first wins
+    def test_89_user_file_parsing_edges(self):
+        lines = "\n".join([
+            "",
+            "# a comment",
+            "   ",
+            "  " + self.pwline("ra", "Ray Anderson") + " ",
+            self.pwline("rb", "Bee B", "disabled"),
+            self.pwline("rc", "See C", "disbaled"),     # TYPO fails CLOSED
+            "NOT A NAME:x",                              # ignored
+            "rd:No Password Yet",                        # parses, cannot log in
+            self.pwline("re", "First"),
+            self.pwline("re", "Second"),                 # duplicate: first wins
+            self.pwline("rf", "Eff", "must-change"),
+        ]) + "\n"
+        store, port, pw = self.roster_server(lines)
         r = store.roster
-        self.assertTrue(r.enforcing)
         self.assertTrue(r.allows("ra"))
         self.assertEqual(r.display("ra"), "Ray Anderson")
-        self.assertFalse(r.allows("rb"))     # disabled
-        self.assertFalse(r.allows("rc"))     # unknown flag -> denied, not allowed
-        self.assertTrue(r.allows("rd"))
-        self.assertEqual(r.display("rd"), "First")
-        self.assertFalse(r.allows("nobody"))
-        for user, want in (("ra", 200), ("rb", 401), ("rc", 401), ("rd", 200)):
+        self.assertFalse(r.allows("rb"))                # disabled
+        self.assertFalse(r.allows("rc"))                # unknown flag -> denied
+        self.assertTrue(r.allows("rd"))                 # listed...
+        self.assertIsNone(r.entry("rd").password)       # ...but no credential
+        self.assertEqual(r.display("re"), "First")
+        for user, want in (("ra", 200), ("rb", 401), ("rc", 401),
+                           ("rd", 401), ("re", 200)):
             st, _ = self.rlogin(port, user)
             self.assertEqual(st, want, user)
+        st, body = self.rlogin(port, "rf")
+        self.assertEqual(st, 200)
+        self.assertTrue(body["must_change"])            # flag from the file
 
-    def test_90_unreadable_roster_denies_everyone(self):
-        store, port, pw = self.roster_server("ra\n")
+    def test_90_unreadable_user_file_denies_everyone(self):
+        store, port, pw = self.roster_server(self.pwline("ra") + "\n")
         st, body = self.rlogin(port, "ra")
         self.assertEqual(st, 200)
         token = body["token"]
         sessions = store.user_dir("ra") / "sessions"
-        # a corrupt roster is NOT evidence that everyone is allowed
+        # a corrupt file is NOT evidence that anyone is allowed
         pw.write_bytes(b"ra\n\xff\xfe not utf-8\n")
         st, _ = self.rreq(port, "GET", "/api/groups", token=token)
         self.assertEqual(st, 401)
         self.assertEqual(len(list(sessions.iterdir())), 1)  # marker kept
-        # nor is deleting it: `rm passwd` must not switch the control off
+        # nor is deleting it: no file = no users
+        saved = self.pwline("ra")
         pw.unlink()
         st, _ = self.rreq(port, "GET", "/api/groups", token=token)
         self.assertEqual(st, 401)
         st, _ = self.rlogin(port, "ra")
         self.assertEqual(st, 401)
-        pw.write_text("ra\n")                    # restored -> access returns
+        pw.write_text(saved + "\n")                  # restored -> access returns
         st, _ = self.rreq(port, "GET", "/api/groups", token=token)
         self.assertEqual(st, 200)
 
-    def test_91_enforcement_is_pinned_at_startup(self):
-        # started with no roster: the allowlist is OFF for this process, and
-        # writing the file later must not silently arm it mid-flight (that
-        # would lock out every account not yet listed)
+    def test_91_users_added_to_the_file_work_without_a_restart(self):
+        # the file is authoritative and hot-reloaded in BOTH directions: it
+        # can start absent (zero users) and grow into existence
         store, port, pw = self.roster_server(None)
-        self.assertFalse(store.roster.enforcing)
-        for user in ("ra", "rb"):
-            st, _ = self.rlogin(port, user)
-            self.assertEqual(st, 200)
-        pw.write_text("ra\n")
-        st, _ = self.rlogin(port, "rb")
-        self.assertEqual(st, 200, "arming needs a restart, by design")
-        # a fresh Store over the same dir DOES pick it up
-        self.assertTrue(chatserver.Store(store.root, iters=1000).roster.enforcing)
+        st, _ = self.rlogin(port, "ra")
+        self.assertEqual(st, 401)
+        pw.write_text(self.pwline("ra") + "\n")
+        st, _ = self.rlogin(port, "ra")
+        self.assertEqual(st, 200, "a new line must be live on the next request")
+        self.assertTrue((store.user_dir("ra") / "queue").is_dir())
 
-    def test_92_revoked_user_is_not_addressable(self):
-        store, port, pw = self.roster_server("ra\nrb\n")
+    def test_92_only_listed_users_are_addressable(self):
+        store, port, pw = self.roster_server(
+            self.pwline("ra") + "\n" + self.pwline("rb") + "\n"
+            + self.pwline("rd", "Never Logged In") + "\n")
         _, a = self.rlogin(port, "ra")
         ta = a["token"]
+        # the FILE is the directory: rd appears although rd never logged in
         st, users = self.rreq(port, "GET", "/api/users", token=ta)
-        self.assertEqual(sorted(u["user"] for u in users["users"]), ["ra", "rb"])
-        pw.write_text("ra\n")               # rb revoked
+        self.assertEqual(sorted(u["user"] for u in users["users"]),
+                         ["ra", "rb", "rd"])
+        # DM to a listed-but-never-provisioned user must QUEUE, not vanish:
+        # first contact provisions their tree on the routing side
+        st, sent = self.rreq(port, "POST", "/api/messages", token=ta,
+                             body={"to": "rd", "text": "welcome",
+                                   "nonce": "nonce-first-contact"})
+        self.assertEqual(st, 200, sent)
+        def queued():
+            q = store.queue_dir("rd")
+            return q.is_dir() and any(q.iterdir())
+        for _ in range(40):
+            if queued():
+                break
+            __import__("time").sleep(0.05)
+        self.assertTrue(queued(),
+                        "first-contact message never reached rd's queue")
+        # rb removed -> hidden from the directory, not DM-able, not addable
+        pw.write_text(self.pwline("ra") + "\n"
+                      + self.pwline("rd", "Never Logged In") + "\n")
         st, users = self.rreq(port, "GET", "/api/users", token=ta)
-        self.assertEqual([u["user"] for u in users["users"]], ["ra"])
-        # nothing sent to a revoked account could ever be read, so refuse it
+        self.assertEqual(sorted(u["user"] for u in users["users"]),
+                         ["ra", "rd"])
         st, _ = self.rreq(port, "POST", "/api/messages", token=ta,
                           body={"to": "rb", "text": "hi",
                                 "nonce": "nonce-revoked-1"})
@@ -2189,47 +2220,74 @@ class ChatServerTest(unittest.TestCase):
         st, _ = self.rreq(port, "POST", "/api/groups", token=ta,
                           body={"name": "g", "members": ["rb"]})
         self.assertEqual(st, 404)
-        st, g = self.rreq(port, "POST", "/api/groups", token=ta,
-                          body={"name": "g", "members": ["rc"]})
-        self.assertEqual(st, 404)           # rc has an account but no entry
-        # provisioning an account that could never log in is refused too
-        with self.assertRaises(chatserver.ApiError) as cm:
-            store.add_user("newbie", "pw-newbie")
-        self.assertEqual(cm.exception.status, 403)
+        st, _ = self.rreq(port, "POST", "/api/groups", token=ta,
+                          body={"name": "g", "members": ["zz"]})
+        self.assertEqual(st, 404)
 
-    def test_93_cli_roster_flow(self):
-        tmp = tempfile.mkdtemp(prefix="chat-cli-roster-")
+    def test_93_cli_flow_and_migration(self):
+        from internalchat.roster import check_hash
+        tmp = tempfile.mkdtemp(prefix="chat-cli-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         pw = chatserver.Path(tmp) / "passwd"
-        pw.write_text("listed:Listed User\n")
-        # an approved name provisions, and takes the roster's display name
+        # adduser = append one line; NO directory is created
         chatserver.main(["adduser", "listed", "--data", tmp,
+                         "--display", "Listed User",
                          "--password", "pw-listed", "--no-change"])
         store = chatserver.Store(tmp, iters=1000)
-        auth = json.loads((store.user_dir("listed") / "auth.json").read_text())
-        self.assertEqual(auth["display"], "Listed User")
-        # an unlisted one is refused...
+        e = store.roster.entry("listed")
+        self.assertEqual(e.display, "Listed User")
+        self.assertTrue(check_hash("pw-listed", e.password))
+        self.assertFalse(store.user_dir("listed").exists())
+        # duplicates are refused and leave the file byte-identical
+        before = pw.read_bytes()
         with self.assertRaises(SystemExit):
-            chatserver.main(["adduser", "walkin", "--data", tmp,
-                             "--password", "pw-walkin"])
-        self.assertFalse((store.user_dir("walkin")).exists())
-        # ...unless the operator approves it in the same breath
-        chatserver.main(["adduser", "walkin", "--data", tmp, "--approve",
-                         "--display", "Walk In", "--password", "pw-walkin",
-                         "--no-change"])
-        self.assertIn("walkin:Walk In", pw.read_text())
-        self.assertTrue(chatserver.Store(tmp, iters=1000).roster.allows("walkin"))
-        # a mistyped --roster must NOT be read as "no allowlist"
+            chatserver.main(["adduser", "listed", "--data", tmp,
+                             "--password", "pw-again"])
+        self.assertEqual(pw.read_bytes(), before)
+        # a rejected password writes nothing at all
+        with self.assertRaises(SystemExit):
+            chatserver.main(["adduser", "ghost", "--data", tmp,
+                             "--password", "short"])
+        self.assertNotIn("ghost", pw.read_text())
+        # admin reset: rewrites the hash in place, old password stops working
+        self.assertIsNotNone(store.verify_password("listed", "pw-listed"))
+        chatserver.main(["passwd", "listed", "--data", tmp,
+                         "--password", "pw-listed-2", "--no-change"])
+        store.roster.invalidate()
+        self.assertIsNone(store.verify_password("listed", "pw-listed"))
+        self.assertIsNotNone(store.verify_password("listed", "pw-listed-2"))
+        # legacy migration: an old-layout account exports as one line that
+        # keeps its EXISTING hash, so nobody's password changes
+        legacy = chatserver.Path(tmp) / "users" / "old"
+        (legacy / "sessions").mkdir(parents=True)
+        import hashlib as _h
+        salt = b"s" * 16
+        h = _h.pbkdf2_hmac("sha256", b"pw-old-123", salt, 1000)
+        (legacy / "auth.json").write_text(json.dumps(
+            {"display": "Old Timer", "salt": salt.hex(), "hash": h.hex(),
+             "iters": 1000, "must_change": True}))
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            chatserver.main(["export-passwd", "--data", tmp])
+        line = [l for l in out.getvalue().splitlines() if l.startswith("old:")]
+        self.assertEqual(len(line), 1)
+        with open(pw, "a") as f:
+            f.write(line[0] + "\n")
+        store.roster.invalidate()
+        e = store.roster.entry("old")
+        self.assertEqual(e.display, "Old Timer")
+        self.assertTrue(e.must_change)
+        self.assertTrue(check_hash("pw-old-123", e.password))
+        # a mistyped --roster must refuse, not run against a phantom file
         with self.assertRaises(SystemExit):
             chatserver.main(["roster", "--data", tmp,
                              "--roster", os.path.join(tmp, "nope")])
         chatserver.main(["roster", "--data", tmp])   # prints, must not raise
 
     def test_94_revocation_interrupts_a_parked_long_poll(self):
-        # a poll parked for 30s was authorized when it started; revoking must
-        # cut the live feed promptly, not when its deadline happens to expire
         import time as _time
-        store, port, pw = self.roster_server("ra\n")
+        store, port, pw = self.roster_server(self.pwline("ra") + "\n")
         _, a = self.rlogin(port, "ra")
         token = a["token"]
         out = {}
@@ -2245,22 +2303,21 @@ class ChatServerTest(unittest.TestCase):
         self.assertFalse(t.is_alive(), "parked poll ignored the revocation")
         self.assertEqual(out["r"][0], 401)
 
-    def test_95_roster_reload_under_concurrent_rewrite(self):
-        """Hammer the auth paths while the file is swapped underneath them.
-        The invariant that must never bend: a user who is not in ANY version
-        of the file never gets a 200. (Swaps are atomic renames here, which is
-        how editors and config management write; the torn-read and
-        stamp-collision cases are covered by test_96 and test_99.)"""
+    def test_95_user_file_swaps_under_concurrent_load(self):
+        """Hammer the auth paths while the file is atomically swapped
+        underneath them. The invariant that must never bend: a user in NO
+        version of the file never gets a 200. (Torn reads and stamp
+        collisions are covered by test_96/test_99.)"""
         import time as _time
-        store, port, pw = self.roster_server("ra\n")
+        ra = self.pwline("ra", "Ray")
+        rc = self.pwline("rc")
+        store, port, pw = self.roster_server(ra + "\n" + rc + "\n")
         toks = {}
         for u in ("ra", "rc"):
-            # rc is briefly listed only to obtain a token, then never again
-            pw.write_text("ra\nrc\n")
             st, b = self.rlogin(port, u)
             self.assertEqual(st, 200, b)
             toks[u] = b["token"]
-        pw.write_text("ra\n")
+        pw.write_text(ra + "\n")                    # rc gone from every version
         stop = threading.Event()
         seen = {"ra": set(), "rc": set()}
         errors = []
@@ -2271,18 +2328,16 @@ class ChatServerTest(unittest.TestCase):
                     st, _ = self.rreq(port, "GET", "/api/groups",
                                       token=toks[user])
                     seen[user].add(st)
-            except Exception as e:      # a connection error is a failure too
+            except Exception as e:
                 errors.append(repr(e))
 
         threads = [threading.Thread(target=hammer, args=(u,))
                    for u in ("ra", "ra", "rc", "rc")]
         for t in threads:
             t.start()
-        # rewrite ATOMICALLY (tmp + rename), the way an editor does: a reader
-        # then sees one whole version or the other, never a torn file
-        tmp = pw.with_suffix(".tmp")
+        tmp = pw.with_suffix(".swp")
         for i in range(60):
-            tmp.write_text("ra:Ray\n" if i % 2 else "ra:Ray\n# churn\n")
+            tmp.write_text(ra + "\n" if i % 2 else ra + "\n# churn\n")
             os.replace(tmp, pw)
             _time.sleep(0.005)
         stop.set()
@@ -2293,19 +2348,13 @@ class ChatServerTest(unittest.TestCase):
         self.assertIn(200, seen["ra"], "the listed user was never served")
         self.assertNotIn(500, seen["ra"])
 
-    # ---- roster failure modes found by the adversarial round ---------------
-
-    def test_96_a_fifo_at_the_roster_path_cannot_wedge_the_server(self):
-        """The worst outcome for an allowlist is neither allow nor deny: a
-        FIFO here used to block the read while holding the lock that every
-        authenticated request needs, parking every worker thread FOREVER —
-        unrecoverable even after the FIFO was removed."""
-        import time as _time
-        store, port, pw = self.roster_server("ra\n")
+    def test_96_a_fifo_at_the_user_file_cannot_wedge_the_server(self):
+        store, port, pw = self.roster_server(self.pwline("ra") + "\n")
         _, a = self.rlogin(port, "ra")
         token = a["token"]
+        saved = pw.read_text()
         pw.unlink()
-        os.mkfifo(pw)                      # no writer: a plain read never returns
+        os.mkfifo(pw)                    # no writer: a plain read never returns
         done = {}
 
         def call():
@@ -2313,18 +2362,14 @@ class ChatServerTest(unittest.TestCase):
         t = threading.Thread(target=call, daemon=True)
         t.start()
         t.join(timeout=15)
-        self.assertFalse(t.is_alive(), "a FIFO roster hung a request thread")
+        self.assertFalse(t.is_alive(), "a FIFO user file hung a request thread")
         self.assertEqual(done["r"][0], 401)      # not readable -> deny
-        # and it must HEAL: replacing the FIFO with a real file restores access
         pw.unlink()
-        pw.write_text("ra\n")
+        pw.write_text(saved)                     # heals without a restart
         st, _ = self.rreq(port, "GET", "/api/groups", token=token)
         self.assertEqual(st, 200)
 
-    def test_97_a_broken_symlink_arms_the_allowlist_rather_than_disabling_it(self):
-        # Path.exists() answers False for a dangling symlink AND for a symlink
-        # loop, so "operator points data/passwd at /etc/... and the target is
-        # later rotated away" used to start the server with the control OFF.
+    def test_97_symlink_failures_and_absence_both_deny(self):
         from internalchat.roster import Roster
         tmp = tempfile.mkdtemp(prefix="chat-roster-link-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -2334,14 +2379,10 @@ class ChatServerTest(unittest.TestCase):
         loop_a, loop_b = root / "loop-a", root / "loop-b"
         loop_a.symlink_to(loop_b)
         loop_b.symlink_to(loop_a)
-        for p in (dangling, loop_a):
-            r = Roster(p)
-            self.assertTrue(r.enforcing, f"{p.name}: allowlist silently off")
-            self.assertFalse(r.allows("anyone"), f"{p.name}: failed OPEN")
-        # a genuinely absent path is still "no allowlist" (back-compat)
-        self.assertFalse(Roster(root / "absent").enforcing)
+        for p in (dangling, loop_a, root / "absent"):
+            self.assertFalse(Roster(p).allows("anyone"), p.name)
 
-    def test_98_oversize_and_irregular_rosters_deny_without_slurping(self):
+    def test_98_oversize_and_irregular_files_deny_without_slurping(self):
         from internalchat.roster import Roster, MAX_ROSTER_BYTES
         import time as _time
         tmp = tempfile.mkdtemp(prefix="chat-roster-big-")
@@ -2355,7 +2396,7 @@ class ChatServerTest(unittest.TestCase):
         self.assertLess(_time.monotonic() - started, 2.0,
                         "the cap must be applied from st_size, not after reading")
         self.assertIn("larger than", r.error or "")
-        d = chatserver.Path(tmp) / "adir"    # a directory is not a roster
+        d = chatserver.Path(tmp) / "adir"    # a directory is not a user file
         d.mkdir()
         self.assertFalse(Roster(d).allows("anyone"))
 
@@ -2382,54 +2423,74 @@ class ChatServerTest(unittest.TestCase):
         _time.sleep(0.3)
         self.assertFalse(r.allows("ra"), "a stamp collision hid a revocation")
 
-    def test_100_approve_cannot_be_tricked_into_forging_an_entry(self):
+    def test_100_writers_cannot_forge_or_clobber(self):
         from internalchat.errors import ApiError
-        tmp = tempfile.mkdtemp(prefix="chat-roster-approve-")
+        from internalchat.roster import make_hash, check_hash
+        tmp = tempfile.mkdtemp(prefix="chat-roster-write-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         pw = chatserver.Path(tmp) / "passwd"
-        pw.write_text("alice:Alice\n")
+        pw.write_text("# staff, do not edit without telling ops\n"
+                      + self.pwline("alice", "Alice") + "\n"
+                      + self.pwline("mole", "Mole", "disabled") + "\n")
         store = chatserver.Store(tmp, iters=1000)
         r = store.roster
-        # str.splitlines() honours EIGHT terminators beyond \n; a display name
-        # carrying any of them used to inject a second, fully-approved line
+        spec = make_hash("pw-victim-1", 1000)
+        # str.splitlines() honours EIGHT terminators beyond \n; a display
+        # carrying any of them would inject a second, fully-approved line
         for bad in ("Al\rmallory", "Al\u2028mallory", "Al\x85mallory",
                     "Al\x0bmallory", "Al\x0cmallory", "Al\x1cmallory",
                     "Al\nmallory", "Al:mallory"):
             with self.assertRaises(ApiError, msg=repr(bad)) as cm:
-                r.approve("victim", bad)
+                r.add_entry("victim", bad, spec)
             self.assertEqual(cm.exception.status, 400, repr(bad))
         self.assertNotIn("mallory", pw.read_text())
-        self.assertFalse(r.allows("mallory"))
-        # approving a name that is already listed is a no-op the parser would
-        # discard (first entry wins), so it must be refused, not "succeed"
-        pw.write_text("alice:Alice\nmole:Mole:disabled\n")
+        # adding a name that exists (even disabled) is a 409, not a silent
+        # no-op line the parser would discard
         for who in ("alice", "mole"):
             with self.assertRaises(ApiError) as cm:
-                r.approve(who)
+                r.add_entry(who, None, spec)
             self.assertEqual(cm.exception.status, 409, who)
-        self.assertFalse(r.allows("mole"))
+        # set_password rewrites EXACTLY one line: the comment and every other
+        # byte survive, and the flags-minus-must-change survive too
+        before = pw.read_text().splitlines()
+        store.set_password("alice", "pw-alice-2")
+        after = pw.read_text().splitlines()
+        self.assertEqual(before[0], after[0])            # comment untouched
+        self.assertEqual(before[2], after[2])            # mole untouched
+        r.invalidate()
+        self.assertTrue(check_hash("pw-alice-2", r.entry("alice").password))
+        with self.assertRaises(ApiError) as cm:
+            r.set_password("nobody", spec)
+        self.assertEqual(cm.exception.status, 404)
 
-    def test_101_a_failed_adduser_never_leaves_the_grant_behind(self):
-        # `adduser <existing> --approve` exited 1 but had ALREADY written the
-        # roster line — silently un-revoking an account the operator had
-        # deliberately removed. A command that reports failure must not grant.
-        tmp = tempfile.mkdtemp(prefix="chat-cli-approve-")
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        pw = chatserver.Path(tmp) / "passwd"
-        pw.write_text("staff:Staff\n")
-        chatserver.main(["adduser", "mole", "--data", tmp, "--approve",
-                         "--password", "pw-mole-1", "--no-change"])
-        self.assertTrue(chatserver.Store(tmp, iters=1000).roster.allows("mole"))
-        pw.write_text("staff:Staff\n")            # operator revokes mole
-        with self.assertRaises(SystemExit):        # account already exists
-            chatserver.main(["adduser", "mole", "--data", tmp, "--approve",
-                             "--password", "pw-mole-2", "--no-change"])
-        self.assertNotIn("mole", pw.read_text())
-        self.assertFalse(chatserver.Store(tmp, iters=1000).roster.allows("mole"))
-        with self.assertRaises(SystemExit):        # rejected password
-            chatserver.main(["adduser", "ghost", "--data", tmp, "--approve",
-                             "--password", "short"])
-        self.assertNotIn("ghost", pw.read_text())
+    def test_101_self_service_password_change_rewrites_the_file(self):
+        store, port, pw = self.roster_server(
+            "# keep this comment\n"
+            + self.pwline("ra", "Ray", "must-change") + "\n"
+            + self.pwline("rb") + "\n")
+        st, body = self.rlogin(port, "ra")
+        self.assertEqual(st, 200)
+        self.assertTrue(body["must_change"])
+        t1 = body["token"]
+        _, b2 = self.rlogin(port, "ra")
+        t2 = b2["token"]
+        st, _ = self.rreq(port, "POST", "/api/password", token=t1,
+                          body={"old": "pw-ra", "new": "pw-ra-new-1"})
+        self.assertEqual(st, 200)
+        text = pw.read_text()
+        self.assertTrue(text.startswith("# keep this comment\n"))
+        self.assertIn("rb:", text)                       # rb's line untouched
+        # the change is live: old password dead, new one works, flag cleared
+        st, _ = self.rlogin(port, "ra")
+        self.assertEqual(st, 401)
+        st, b3 = self.rlogin(port, "ra", password="pw-ra-new-1")
+        self.assertEqual(st, 200)
+        self.assertFalse(b3["must_change"])
+        # every OTHER session died with the change; the changer's survived
+        st, _ = self.rreq(port, "GET", "/api/groups", token=t2)
+        self.assertEqual(st, 401)
+        st, _ = self.rreq(port, "GET", "/api/groups", token=t1)
+        self.assertEqual(st, 200)
 
 
 if __name__ == "__main__":

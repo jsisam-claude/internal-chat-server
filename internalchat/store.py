@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import errno
 import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -26,9 +25,9 @@ class Store:
     def __init__(self, root, iters: int = PBKDF2_ITERS, roster=None):
         self.root = Path(root).resolve()
         self.iters = iters
-        # The allowlist of who may connect. Defaults to <data>/passwd; absent
-        # means "not enforced", so every existing deployment keeps working
-        # exactly as before until an operator writes the file.
+        # THE user database: one passwd-style file, password hash last field
+        # (see roster.py). Defaults to <data>/passwd; --roster overrides.
+        # Absent file = zero users until it exists.
         self.roster = Roster(Path(roster) if roster else self.root / "passwd")
         self._id_lock = threading.Lock()
         self._quota_lock = threading.Lock()
@@ -209,81 +208,79 @@ class Store:
                               str(used + length).encode())
 
     # ---- users / auth ----------------------------------------------------
+    # The user FILE (see roster.py) is the entire user database: identity,
+    # display, flags, and the password hash as its last field. There is no
+    # per-account credential file, and no manual provisioning step: an
+    # account's directory tree is created on FIRST CONTACT — the first
+    # successful login, or the first message routed to the user.
+
     def add_user(self, user: str, password: str, display: str | None = None,
-                 must_change: bool = True, bypass_roster: bool = False) -> None:
-        if not USER_RE.match(user):
-            raise ApiError(400, "bad username (allowed: [a-z0-9_.-]{1,32})")
-        # Provisioning an account the roster doesn't list would create
-        # something that can never log in; refuse instead of leaving a
-        # confusing half-provisioned name behind. `bypass_roster` is for the
-        # one caller that is about to add the entry itself (adduser
-        # --approve), which grants only AFTER this succeeds — so a failure
-        # here can never leave a grant behind.
-        if not bypass_roster and not self.roster.allows(user):
-            raise ApiError(403, f"{user!r} is not on the roster "
-                                f"({self.roster.path}) — add it there first")
+                 must_change: bool = True) -> None:
+        """Append the user to the file (nothing else): the directory follows
+        on first contact. Hashing happens before any write, so a failure
+        anywhere can never leave a half-made entry behind."""
+        from .roster import make_hash
+        self.roster.add_entry(user, display, make_hash(password, self.iters),
+                              must_change=must_change)
+
+    def provision(self, user: str) -> None:
+        """Create the account's directory tree, idempotently. Built whole in
+        tmp/ and renamed in atomically: a crash leaves only a tmp orphan
+        (janitor-pruned) and a concurrent first-contact race is settled by
+        the rename — the loser just uses the winner's tree."""
         d = self.user_dir(user)
-        if d.exists():
-            raise ApiError(409, "user exists")
-        salt = secrets.token_bytes(16)
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, self.iters)
-        auth = {"display": display or user, "salt": salt.hex(), "hash": h.hex(),
-                "iters": self.iters, "must_change": must_change, "created": now_ms()}
-        # Build the whole user tree in tmp/ and rename it in atomically. A
-        # half-built tree (mkdirs done, auth.json not yet written) used to wedge
-        # the name forever: d.exists() true but user_exists() false, so retries
-        # 409'd and the account could never authenticate. Now a crash leaves
-        # only a tmp orphan (janitor-pruned) and the name stays reusable.
+        if d.is_dir():
+            return
         tmp = self.root / "tmp" / f"u-{user}-{secrets.token_hex(4)}"
         for sub in ("sessions", "queue", "staged", "nonces", "starred"):
             (tmp / sub).mkdir(parents=True)
-        (tmp / "auth.json").write_bytes(json.dumps(auth).encode())
         try:
-            os.rename(tmp, d)   # atomic; fails if a racing create populated d
+            os.rename(tmp, d)
         except OSError as e:
             shutil.rmtree(tmp, ignore_errors=True)
-            # only a lost create-race is "exists"; a filesystem error (ENOSPC,
-            # EXDEV) is transient and must not masquerade as a taken name
             if e.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR):
-                raise ApiError(409, "user exists")
-            raise ApiError(503, "user create failed, please retry")
+                return                    # someone else provisioned: done
+            raise ApiError(503, "user provisioning failed, please retry")
 
     def user_exists(self, user: str) -> bool:
-        """Has an ACCOUNT. Deliberately says nothing about the roster: admin
-        paths (passwd reset, bouncing a message back to its sender) act on
-        accounts, whether or not the operator has since revoked them."""
-        return bool(USER_RE.match(user)) and (self.user_dir(user) / "auth.json").is_file()
+        """Listed in the user file, disabled or not. Admin paths (passwd
+        reset, bouncing a message back to its sender) act on listed users
+        whether or not they may currently connect."""
+        return (bool(USER_RE.match(user))
+                and self.roster.entry(user) is not None)
 
     def may_connect(self, user: str) -> bool:
-        """Has an account AND is allowed by the roster — i.e. someone who can
-        actually be a party to a conversation. This is the predicate every
-        "is that a real user?" check in the API wants; revoked accounts must
-        not be DM-able or addable to groups, because nothing they are sent
-        can ever be read."""
-        return self.user_exists(user) and self.roster.allows(user)
+        """Listed AND not disabled — someone who can actually be a party to
+        a conversation. The predicate every "is that a real user?" check in
+        the API wants: a disabled/removed account must not be DM-able or
+        addable to a group, because nothing sent to it can ever be read."""
+        return bool(USER_RE.match(user)) and self.roster.allows(user)
 
-    def verify_password(self, user: str, password: str) -> dict | None:
-        try:
-            auth = json.loads((self.user_dir(user) / "auth.json").read_text())
-        except (FileNotFoundError, ValueError):
-            # burn comparable time so unknown users aren't distinguishable
-            hashlib.pbkdf2_hmac("sha256", password.encode(), b"x" * 16, self.iters)
+    def verify_password(self, user: str, password: str):
+        """The file's entry when the password matches, else None. Timing is
+        flat across every failure shape: unknown user, password-less entry,
+        malformed hash spec, and wrong password all cost one PBKDF2; the
+        `disabled` check runs AFTER the hash for the same reason."""
+        from .roster import check_hash, burn
+        e = self.roster.entry(user)
+        if e is None or not e.password:
+            burn(self.iters)
             return None
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(),
-                                bytes.fromhex(auth["salt"]), auth["iters"])
-        return auth if hmac.compare_digest(h.hex(), auth["hash"]) else None
+        if not check_hash(password, e.password):
+            return None
+        return None if e.disabled else e
 
     def set_password(self, user: str, password: str,
                      must_change: bool = False) -> None:
-        auth = json.loads((self.user_dir(user) / "auth.json").read_text())
-        salt = secrets.token_bytes(16)
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, self.iters)
-        auth.update(salt=salt.hex(), hash=h.hex(), iters=self.iters,
-                    must_change=must_change)
-        self.write_atomic(self.user_dir(user) / "auth.json", json.dumps(auth).encode())
+        from .roster import make_hash
+        self.roster.set_password(user, make_hash(password, self.iters),
+                                 must_change=must_change)
 
     # ---- sessions (token = "<user>:<secret>", stored as sha256 marker) ----
     def new_session(self, user: str) -> str:
+        # first contact, post successful auth: the account's tree appears the
+        # first time a session is actually issued
+        self.provision(user)
         token = f"{user}:{secrets.token_urlsafe(32)}"
         (self.user_dir(user) / "sessions" /
          hashlib.sha256(token.encode()).hexdigest()).touch()
@@ -407,7 +404,17 @@ class Store:
         except FileExistsError:
             pass
         except FileNotFoundError:
-            pass  # user deleted underneath us
+            # Either the user was deleted underneath us, or they are LISTED
+            # but have never logged in: first contact can be a message routed
+            # TO someone (a DM to a colleague who hasn't installed the app
+            # yet must queue, not vanish). Provision and retry once.
+            if self.roster.entry(user) is None:
+                return
+            try:
+                self.provision(user)
+                os.symlink(rel, link)
+            except (OSError, ApiError):
+                pass
 
     # ---- messages ----------------------------------------------------------
     def _spool_dir(self, mid: str, gid: str, sender: str, text: str) -> Path:

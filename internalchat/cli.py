@@ -1,8 +1,10 @@
-"""Command-line entry: `serve`, `adduser`, `roster`, `passwd`."""
+"""Command-line entry: `serve`, `adduser`, `passwd`, `roster`, `hashpw`,
+`export-passwd`."""
 from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import sys
 from pathlib import Path
 
@@ -15,13 +17,13 @@ from .server import build_server
 DESCRIPTION = "internal-chat server (folder-queue, stdlib only, no database)"
 
 def _store(args) -> Store:
-    """One Store constructor for every subcommand, so the roster path is
+    """One Store constructor for every subcommand, so the user-file path is
     resolved identically. An EXPLICIT --roster that isn't there is a hard
-    error: silently treating a mistyped path as "no allowlist" is exactly
-    how this control would get switched off without anyone noticing."""
+    error: silently treating a mistyped path as "empty user file" would lock
+    everyone out while looking like a clean start."""
     if getattr(args, "roster", None) and not Path(args.roster).is_file():
         raise ApiError(400, f"--roster {args.roster}: no such file (refusing "
-                            "to run with the allowlist silently disabled)")
+                            "to run against a user file that does not exist)")
     return Store(args.data, roster=getattr(args, "roster", None))
 
 
@@ -44,7 +46,7 @@ def cmd_serve(args) -> None:
 
 
 def _password(args, prompt: str) -> str:
-    """One rule for both commands, and the SAME rule POST /api/password
+    """One rule for every command, and the SAME rule POST /api/password
     enforces — the CLI used to accept a 1-character or even empty password,
     which is a weaker account than the API would ever let a user create."""
     pw = args.password if args.password is not None else getpass.getpass(prompt)
@@ -54,66 +56,100 @@ def _password(args, prompt: str) -> str:
 
 
 def cmd_adduser(args) -> None:
+    """Append one line to the user file. That is the WHOLE of provisioning:
+    the account's directory appears by itself on first contact (first login,
+    or the first message routed to the user)."""
     store = _store(args)
     password = _password(args, f"initial password for {args.user}: ")
-    # the roster's display name is the operator's central one; honour it
-    # unless this command was given an explicit --display
-    display = args.display or store.roster.display(args.user)
-    # ORDER MATTERS: grant LAST. Approving first meant a command that then
-    # failed (the account already exists, a rejected password, Ctrl-C at the
-    # prompt) still left the roster line behind — silently un-revoking an
-    # account the operator had deliberately removed, while exiting non-zero.
-    store.add_user(args.user, password, display=display,
-                   must_change=not args.no_change,
-                   bypass_roster=args.approve)
-    if args.approve:
-        try:
-            store.roster.approve(args.user, args.display)
-            print(f"approved {args.user!r} in {store.roster.path}")
-        except ApiError as e:
-            # the account exists but cannot connect: say so plainly rather
-            # than reporting a success the roster does not back
-            print(f"warning: account created but NOT approved: {e.message}",
-                  file=sys.stderr)
-    print(f"user {args.user!r} created (must change password on first login: "
-          f"{not args.no_change})")
-
-
-def cmd_roster(args) -> None:
-    """Show the allowlist next to the accounts, because the two drift: an
-    approved name with no account can't log in yet, and an account with no
-    entry is revoked but still holds its data."""
-    store = _store(args)
-    r = store.roster
-    if not r.enforcing:
-        print(f"no roster at {r.path} — every provisioned account may connect")
-    if r.error:
-        print(f"roster UNREADABLE ({r.error}): every user is denied")
-    entries = r.entries()
-    accounts = sorted(p.name for p in (store.root / "users").iterdir()
-                      if (p / "auth.json").is_file())
-    for name in sorted(set(entries) | set(accounts)):
-        e = entries.get(name)
-        if e is None:
-            state = "REVOKED (account only)" if r.enforcing else "account"
-        elif e.disabled:
-            state = "disabled"
-        elif name not in accounts:
-            state = "approved, no account yet"
-        else:
-            state = "ok"
-        print(f"{name:<20} {state:<24} {(e.display if e else '') or ''}")
+    store.add_user(args.user, password, display=args.display,
+                   must_change=not args.no_change)
+    print(f"user {args.user!r} added to {store.roster.path} "
+          f"(must change password on first login: {not args.no_change})")
 
 
 def cmd_passwd(args) -> None:
     store = _store(args)
     if not store.user_exists(args.user):
-        raise ApiError(404, "no such user")
+        raise ApiError(404, f"no such user in {store.roster.path}")
     password = _password(args, f"new password for {args.user}: ")
     store.set_password(args.user, password, must_change=not args.no_change)
-    for s in (store.user_dir(args.user) / "sessions").iterdir():
-        s.unlink(missing_ok=True)  # admin reset logs the user out everywhere
+    sessions = store.user_dir(args.user) / "sessions"
+    if sessions.is_dir():          # never provisioned = nothing to invalidate
+        for s in sessions.iterdir():
+            s.unlink(missing_ok=True)  # admin reset logs them out everywhere
     print(f"password reset for {args.user!r}; all sessions invalidated")
+
+
+def cmd_roster(args) -> None:
+    """The user file against the on-disk account state. The one drift that
+    still exists is entries that have never made first contact (no directory
+    yet) — and legacy directories whose line was removed (revoked)."""
+    store = _store(args)
+    r = store.roster
+    entries = r.entries()
+    if r.error:
+        print(f"user file UNREADABLE ({r.error}): every user is denied")
+    elif not entries:
+        print(f"no users in {r.path} — no one can log in")
+    provisioned = set()
+    users_root = store.root / "users"
+    if users_root.is_dir():
+        provisioned = {p.name for p in users_root.iterdir() if p.is_dir()}
+    for name in sorted(set(entries) | provisioned):
+        e = entries.get(name)
+        if e is None:
+            state = "REVOKED (data on disk, no entry)"
+        elif e.disabled:
+            state = "disabled"
+        elif not e.password:
+            state = "no password set"
+        elif e.must_change:
+            state = "must change password"
+        elif name not in provisioned:
+            state = "listed, no contact yet"
+        else:
+            state = "ok"
+        print(f"{name:<20} {state:<28} {(e.display if e else '') or ''}")
+
+
+def cmd_hashpw(args) -> None:
+    """Print a password-hash spec to paste into the user file by hand — for
+    operators who manage the file in git/config-management and never run
+    adduser on the box."""
+    from .roster import make_hash
+    from .config import PBKDF2_ITERS
+    password = _password(args, "password to hash: ")
+    print(make_hash(password, PBKDF2_ITERS))
+
+
+def cmd_export_passwd(args) -> None:
+    """Migration from the legacy per-account auth.json layout: emit one user
+    line per existing account, preserving display, must-change, and the
+    EXISTING hash (already pbkdf2-sha256, so nobody's password changes).
+    Redirect into the user file:  chatserver.py export-passwd --data D >> D/passwd"""
+    store = Store.__new__(Store)          # raw: no roster needed to read legacy
+    store.root = Path(args.data).resolve()
+    users_root = store.root / "users"
+    if not users_root.is_dir():
+        raise ApiError(404, f"no users/ under {store.root}")
+    count = 0
+    for udir in sorted(users_root.iterdir()):
+        authf = udir / "auth.json"
+        if not authf.is_file():
+            continue
+        try:
+            a = json.loads(authf.read_text())
+            spec = f"pbkdf2-sha256${a['iters']}${a['salt']}${a['hash']}"
+            display = str(a.get("display", "") or "")
+            if ":" in display or not display.isprintable():
+                display = ""
+            flags = "must-change" if a.get("must_change") else ""
+            print(f"{udir.name}:{display}:{flags}:{spec}")
+            count += 1
+        except (ValueError, KeyError) as e:
+            print(f"# SKIPPED {udir.name}: unreadable auth.json ({e})",
+                  file=sys.stderr)
+    print(f"# exported {count} users", file=sys.stderr)
 
 
 def main(argv=None) -> None:
@@ -128,23 +164,21 @@ def main(argv=None) -> None:
     sp.add_argument("--static", help="directory with the web client to serve")
     sp.add_argument("--retain-days", type=int, default=0,
                     help="archive day folders older than N days (0 = keep)")
-    sp.add_argument("--roster", help="allowlist of who may connect "
-                                     "(default: <data>/passwd, if present)")
+    sp.add_argument("--roster", help="the user file "
+                                     "(default: <data>/passwd)")
     sp.set_defaults(func=cmd_serve)
 
-    au = sub.add_parser("adduser", help="provision a user")
+    au = sub.add_parser("adduser", help="add a user (one line in the user file)")
     au.add_argument("user")
     au.add_argument("--data", default="./data")
     au.add_argument("--roster")
     au.add_argument("--display")
-    au.add_argument("--approve", action="store_true",
-                    help="add the user to the roster first (it must exist)")
     au.add_argument("--password", help="set non-interactively (visible in ps!)")
     au.add_argument("--no-change", action="store_true",
                     help="don't force a password change on first login")
     au.set_defaults(func=cmd_adduser)
 
-    ro = sub.add_parser("roster", help="show the allowlist and the accounts")
+    ro = sub.add_parser("roster", help="show the user file vs on-disk state")
     ro.add_argument("--data", default="./data")
     ro.add_argument("--roster")
     ro.set_defaults(func=cmd_roster)
@@ -158,6 +192,16 @@ def main(argv=None) -> None:
                     help="don't force a password change on next login")
     pw.set_defaults(func=cmd_passwd)
 
+    hp = sub.add_parser("hashpw",
+                        help="print a hash spec to paste into the user file")
+    hp.add_argument("--password", help="hash non-interactively (visible in ps!)")
+    hp.set_defaults(func=cmd_hashpw)
+
+    ex = sub.add_parser("export-passwd",
+                        help="emit user-file lines from legacy auth.json accounts")
+    ex.add_argument("--data", default="./data")
+    ex.set_defaults(func=cmd_export_passwd)
+
     args = ap.parse_args(argv)
     try:
         args.func(args)
@@ -167,4 +211,3 @@ def main(argv=None) -> None:
     except (EOFError, KeyboardInterrupt):
         print("error: no password supplied", file=sys.stderr)
         sys.exit(1)
-
