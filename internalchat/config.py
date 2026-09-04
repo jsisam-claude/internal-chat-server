@@ -77,8 +77,13 @@ QUEUE_PAGE = 500
 # notes it fetched with its auth header (fetch -> Blob -> object URL); blob:
 # URLs are same-origin-created media only, so this widens nothing an
 # attacker controls.
-CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
-       "connect-src 'self'; img-src 'self' blob:; "
+# manifest-src is NOT covered by script-/style-/connect-src — it falls back to
+# default-src, which is 'none', so the browser refused /manifest.json outright
+# and the entire PWA surface (name, all five icons, display:standalone,
+# installability) was silently dead. Same-origin static JSON that _static
+# already serves, so naming it here widens nothing.
+CSP = ("default-src 'none'; manifest-src 'self'; script-src 'self'; "
+       "style-src 'self'; connect-src 'self'; img-src 'self' blob:; "
        "media-src 'self' blob:; base-uri 'none'; "
        "form-action 'none'; frame-ancestors 'none'")
 
