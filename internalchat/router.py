@@ -157,6 +157,13 @@ class Janitor(threading.Thread):
                     pass
 
         prune(self.store.root / "tmp", 3600, dirs=True)
+        # Bounced messages: nothing reclaimed them, so a failed send's
+        # attachments sat on disk permanently. 3 days is long enough for the
+        # sender's client to have surfaced the ~x~ failure. The stranded
+        # <mid>~x~server queue symlinks left behind point at nothing and are
+        # swept by the dangling-link pass below. Pruned BEFORE the recount, so
+        # the recount sees the post-prune tree.
+        prune(self.store.root / "rejected", 3 * 86400, dirs=True)
         for udir in (self.store.root / "users").iterdir():
             self._prune_staged(udir, now)   # credits storage back on expiry
             # empty nonce files are aborted send-claims; reclaim them fast

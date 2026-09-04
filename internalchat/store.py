@@ -167,17 +167,32 @@ class Store:
                 groups.extend(root.iterdir())   # archived bytes are still bytes
             except FileNotFoundError:
                 pass
+        def count_msg(mdir: Path) -> None:
+            try:
+                sender = (mdir / "from").read_text().strip()
+                if sender not in totals:
+                    return                # unknown/removed account
+                for blob in (mdir / "attachments").iterdir():
+                    if not blob.name.endswith(".meta"):
+                        totals[sender] += blob.stat().st_size
+            except OSError:
+                return
+
         for gdir in groups:
             for mdir in msg_dirs_newest_first(gdir):
-                try:
-                    sender = (mdir / "from").read_text().strip()
-                    if sender not in totals:
-                        continue          # unknown/removed account
-                    for blob in (mdir / "attachments").iterdir():
-                        if not blob.name.endswith(".meta"):
-                            totals[sender] += blob.stat().st_size
-                except OSError:
-                    continue
+                count_msg(mdir)
+        # Bounced messages are STILL BYTES ON DISK. Leaving rejected/ out of
+        # this walk meant the hourly recount refunded the sender's quota while
+        # the blobs stayed forever: a user could race a send against leaving
+        # the group, park up to 8x50MB per win, and get the whole allowance
+        # back an hour later. rejected/<mid> is a message dir, not a group
+        # dir, so it is walked directly rather than through msg_dirs.
+        try:
+            for mdir in (self.root / "rejected").iterdir():
+                if mdir.is_dir():
+                    count_msg(mdir)
+        except FileNotFoundError:
+            pass
         for user, total in totals.items():
             with self._quota_lock:
                 try:
