@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
-from .config import CSP, STATIC_TYPES, MAX_JSON, MAX_WAIT, MAX_CONNECTIONS
+from .config import (CSP, STATIC_TYPES, MAX_JSON, MAX_WAIT, MAX_CONNECTIONS,
+                      HANDSHAKE_TIMEOUT)
 from .errors import ApiError
 from .util import log
 from .store import Store
@@ -466,8 +467,34 @@ class Handler(BaseHTTPRequestHandler):
         self._send_static(target)
 
     def _send_static(self, path: Path) -> None:
+        """Streamed, never slurped. read_bytes() materialised the whole file on
+        the heap and held it there until the last byte reached a possibly-slow
+        socket — and /download/app.apk is served from here, BEFORE any auth
+        check. A few dozen unauthenticated clients asking for a 40 MB APK and
+        then reading at a trickle was MAX_CONNECTIONS x filesize of live heap
+        on the one small VM this is meant to run on: OOM, and every user loses
+        chat. Peak is now one 64 KiB chunk per request. Content-Length comes
+        from the OPEN fd, not a second stat, which also closes the stat/open
+        race the same way _send_blob does."""
         ctype = STATIC_TYPES.get(path.suffix.lower())
-        data = path.read_bytes()
+        with open(path, "rb") as f:
+            fsize = os.fstat(f.fileno()).st_size
+            self._send_static_head(path, ctype, fsize)
+            if self._head:      # HEAD: true Content-Length, zero body bytes,
+                return          # and now zero bytes READ as well
+            remaining = fsize
+            while remaining:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    # shrank mid-stream: Content-Length can no longer be
+                    # honored, so kill the connection rather than let the
+                    # client read the next response as this body's tail
+                    self.close_connection = True
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
+    def _send_static_head(self, path: Path, ctype, length: int) -> None:
         self.send_response(200)
         if ctype is None:
             ctype = "application/octet-stream"
@@ -479,10 +506,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Security-Policy", CSP)
             self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(length))
         self.end_headers()
-        if not self._head:   # HEAD: true Content-Length, zero body bytes
-            self.wfile.write(data)
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
@@ -497,6 +522,7 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self._conn_slots = threading.BoundedSemaphore(self.max_connections)
+        self.tls_context = None      # set by build_server when --cert is given
 
     def process_request(self, request, client_address):
         if not self._conn_slots.acquire(blocking=False):
@@ -506,9 +532,40 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 
     def process_request_thread(self, request, client_address):
         try:
+            if self.tls_context is not None:
+                request = self._handshake(request)
+                if request is None:
+                    return
             super().process_request_thread(request, client_address)
         finally:
             self._conn_slots.release()
+
+    def _handshake(self, sock):
+        """TLS handshake, in the WORKER thread and on a clock.
+
+        It used to happen inside accept(): wrapping the LISTENING socket makes
+        SSLSocket.accept() do the handshake before it returns, on a socket with
+        no timeout, in serve_forever's single accept loop. One unauthenticated
+        peer that completed the TCP connect and then sent nothing blocked that
+        loop forever — the whole server, from one connection and zero bytes,
+        with httpd.shutdown() unable to return either. None of the hardening
+        below the accept applied, because nothing below the accept ever ran:
+        the semaphore, the 75s handler timeout and the slowloris story in this
+        class's docstring are all downstream of it.
+
+        Here it costs one bounded slot and gives up after HANDSHAKE_TIMEOUT."""
+        try:
+            sock.settimeout(HANDSHAKE_TIMEOUT)
+            tls = self.tls_context.wrap_socket(sock, server_side=True)
+        except (OSError, ValueError):
+            # timeout, a non-TLS peer, an unsupported version, a bad cert —
+            # all of it is one dead connection, never a server-wide event
+            self.shutdown_request(sock)
+            return None
+        # back to blocking for the request itself: Handler.timeout owns the
+        # read deadline from here, and a leftover 15s would break long-polls
+        tls.settimeout(None)
+        return tls   # the WRAPPED socket is what the handler must be given
 
 
 def build_server(store: Store, host: str, port: int,
@@ -524,7 +581,10 @@ def build_server(store: Store, host: str, port: int,
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(certfile)
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        # The LISTENER stays plain on purpose — see BoundedHTTPServer._handshake.
+        # Wrapping it here put the handshake inside accept(), where one silent
+        # connection wedged the entire server.
+        httpd.tls_context = ctx
     router.start()
     return httpd, router, api
 

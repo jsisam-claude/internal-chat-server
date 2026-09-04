@@ -61,6 +61,11 @@ LASTSEEN_PERSIST_SECS = 300    # write users/<u>/lastseen at most this often
 USER_STORAGE_QUOTA = 2 * 1024 * 1024 * 1024   # 2 GB of attachments per user
 MAX_CONNECTIONS = 512    # global cap on concurrent request threads (bounds the
                          # thread/FD cost of a long-poll flood)
+
+HANDSHAKE_TIMEOUT = 15   # seconds a TLS handshake may take before the
+                         # connection is dropped. It runs in the worker
+                         # thread (never the accept loop), so a stalled
+                         # one costs a bounded slot, not the server.
 MAX_POLLS_PER_USER = 8   # concurrent parked long-polls one user may hold
 # Max queue entries returned by one poll. A user offline while a busy group
 # ran hot can accumulate thousands; without a page the response balloons and
