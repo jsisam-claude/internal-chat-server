@@ -278,10 +278,16 @@ class Store:
         `disabled` check runs AFTER the hash for the same reason."""
         from .roster import check_hash, burn
         e = self.roster.entry(user)
+        # what a REAL verify against this file costs — not self.iters, which
+        # is what the next hash we WRITE will cost. The two differ for as long
+        # as it takes everyone to change their password after an operator
+        # raises PBKDF2_ITERS, and burning the wrong one makes an unknown
+        # username measurably slower (or faster) than a known one.
+        cost = self.roster.hash_cost(self.iters)
         if e is None or not e.password:
-            burn(self.iters)
+            burn(cost)
             return None
-        if not check_hash(password, e.password):
+        if not check_hash(password, e.password, cost):
             return None
         return None if e.disabled else e
 

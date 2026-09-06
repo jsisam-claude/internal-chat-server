@@ -64,14 +64,45 @@ from .config import USER_RE
 from .errors import ApiError
 from .util import log
 
-# ~30k entries at a typical line length. A mistyped --roster (a log file, a
-# device node) must not be slurped into memory — checked against the file's
-# size BEFORE reading, then again against what was actually read.
+# A mistyped --roster (a log file, a device node) must not be slurped into
+# memory — checked against the file's size BEFORE reading, then again against
+# what was actually read. It is a fail-CLOSED cap: above it nobody can log in,
+# so it doubles as a capacity limit and every WRITER checks it too (see
+# _check_cap) rather than appending a line that bricks the deployment. With
+# the 118-char pbkdf2 spec as the last field a typical line is ~141 bytes, so
+# 1 MiB is roughly 7,400 users — four times fewer than the pre-hash roster of
+# the same size held, and far above the "hundreds of users" this is built for.
 MAX_ROSTER_BYTES = 1 << 20
 # Upper bound on how long a stat-stamp collision can hide a change.
 STALE_AFTER = 5.0
 
 KNOWN_FLAGS = {"disabled", "must-change"}
+
+
+def _spec_iters(spec: str) -> int | None:
+    """The iteration count out of a hash spec, or None if it isn't one."""
+    try:
+        scheme, iters_s, _salt, _hash = spec.split("$")
+        return int(iters_s) if scheme == "pbkdf2-sha256" else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _median_iters(entries: dict) -> int | None:
+    """What verifying a TYPICAL line in this file costs.
+
+    Hash specs are self-describing so iterations can be raised without
+    breaking existing lines (API.md says so out loud) — which means the
+    configured PBKDF2_ITERS and the file's stored counts routinely disagree,
+    for as long as it takes every user to change their password. burn() has
+    to imitate a real verify, so it must burn what the FILE costs, not what
+    the config would cost: burning the raised count made an unknown username
+    take twice as long as a known one with a wrong password, and login became
+    a username-existence oracle (the exact thing flat timing exists to deny).
+    """
+    costs = sorted(c for e in entries.values()
+                   if e.password and (c := _spec_iters(e.password)))
+    return costs[len(costs) // 2] if costs else None
 
 
 # ---- password hashes (self-describing, so iterations can be raised later
@@ -82,10 +113,11 @@ def make_hash(password: str, iters: int) -> str:
     return f"pbkdf2-sha256${iters}${salt.hex()}${h.hex()}"
 
 
-def check_hash(password: str, spec: str) -> bool:
+def check_hash(password: str, spec: str, burn_iters: int = 600_000) -> bool:
     """Constant-time verify; False for anything malformed (fail closed). A
     malformed spec still burns a comparable amount of work so a broken line
-    is not distinguishable from a wrong password by timing."""
+    is not distinguishable from a wrong password by timing — `burn_iters`
+    is what a real verify against THIS file costs (Roster.hash_cost)."""
     try:
         scheme, iters_s, salt_hex, hash_hex = spec.split("$")
         if scheme != "pbkdf2-sha256":
@@ -95,7 +127,7 @@ def check_hash(password: str, spec: str) -> bool:
             raise ValueError
         salt, want = bytes.fromhex(salt_hex), bytes.fromhex(hash_hex)
     except (ValueError, AttributeError):
-        burn(600_000)
+        burn(burn_iters)
         return False
     got = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iters)
     return hmac.compare_digest(got, want)
@@ -122,7 +154,7 @@ class Roster:
         # reader never sees a stamp that disagrees with its entries. No lock:
         # a change may be parsed twice concurrently, which is cheap — while a
         # lock held across the read is how one bad file wedges every thread.
-        self._cache: tuple = (object(), {}, None, 0.0)
+        self._cache: tuple = (object(), {}, None, 0.0, None)
         self._logged: str | None = None
         n = len(self.entries())
         if n:
@@ -141,11 +173,12 @@ class Roster:
         and at least every STALE_AFTER seconds. Empty when absent or when it
         cannot be read — either way no one is allowed, by design."""
         stamp = self._stat()
-        cstamp, centries, _, read_at = self._cache
+        cstamp, centries, _, read_at, _cost = self._cache
         if stamp == cstamp and (time.monotonic() - read_at) < STALE_AFTER:
             return centries
         parsed, err = self._parse()          # no lock held: must never block
-        self._cache = (stamp, parsed, err, time.monotonic())
+        self._cache = (stamp, parsed, err, time.monotonic(),
+                       _median_iters(parsed))
         if err != self._logged:
             self._logged = err
             if err:
@@ -253,7 +286,28 @@ class Roster:
         e = self.entries().get(user)
         return e.display if e else None
 
+    def hash_cost(self, default: int) -> int:
+        """Iterations a real verify against this file costs — the number
+        burn() must spend so every login failure shape stays flat. See
+        _median_iters; `default` covers a file with no hashed entries."""
+        self.entries()                     # refresh (one stat) before reading
+        return self._cache[4] or default
+
     # ---- writing (the CLI, and the server on password change) --------------
+    def _check_cap(self, size: int) -> None:
+        """Refuse a write that would push the file past MAX_ROSTER_BYTES.
+
+        Above the cap `_read` fail-closes, so crossing it does not merely fail
+        to help: it DENIES EVERY USER on the next stat — including live
+        sessions — from a command (`adduser`, an admin `passwd`) that would
+        otherwise print success and exit 0. Refuse here, while the operator is
+        still watching, instead of at everyone's next login."""
+        if size > MAX_ROSTER_BYTES:
+            raise ApiError(507, f"{self.path} would exceed MAX_ROSTER_BYTES "
+                                f"({MAX_ROSTER_BYTES} bytes), above which the "
+                                "file is UNREADABLE and EVERY user is denied "
+                                "— prune it or raise the cap")
+
     def _lock(self):
         """A sidecar lock, because the file itself is atomically REPLACED on
         rewrite — an flock on the old inode would guard nothing. Serializes
@@ -296,15 +350,21 @@ class Roster:
         if not USER_RE.match(user):
             raise ApiError(400, "bad username (allowed: [a-z0-9_.-]{1,32})")
         self._check_display(display)
-        fd = self._lock()
+        # The lock is acquired INSIDE the try: `_lock` creates <path>.lock,
+        # which needs write permission on the DIRECTORY, and the documented
+        # hardening stance (root-owned /etc, ProtectSystem=strict) denies
+        # exactly that. Outside the try its PermissionError/EROFS escaped as a
+        # 500 + traceback instead of the 503 this method promises.
+        fd = None
         try:
+            fd = self._lock()
             if self.invalidate().get(user) is not None:
                 # appending would be a silent no-op: the parser takes the
                 # FIRST entry for a name
                 raise ApiError(409, f"{user!r} already exists in {self.path}")
             flags = ["must-change"] if must_change else []
             line = self._fmt(user, display, flags, password)
-            need_nl = False
+            size, need_nl = 0, False
             try:
                 size = self.path.stat().st_size
                 if size:
@@ -313,6 +373,7 @@ class Roster:
                         need_nl = f.read(1) != b"\n"
             except FileNotFoundError:
                 pass                     # first user creates the file
+            self._check_cap(size + need_nl + len(line.encode()) + 1)
             with open(self.path, "a", encoding="utf-8") as f:
                 if f.tell() == 0:
                     os.fchmod(f.fileno(), 0o600)   # it holds hashes now
@@ -320,7 +381,8 @@ class Roster:
         except OSError as e:
             raise ApiError(503, f"cannot write {self.path}: {e.strerror or e}")
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
 
     def set_password(self, user: str, password_spec: str,
                      must_change: bool = False) -> None:
@@ -330,8 +392,9 @@ class Roster:
         never a torn line."""
         if not self.path:
             raise ApiError(400, "no user file path configured")
-        fd = self._lock()
+        fd = None
         try:
+            fd = self._lock()      # inside the try: see add_entry
             raw, err = self._read()
             if err:
                 raise ApiError(503, err)
@@ -339,7 +402,13 @@ class Roster:
                 text = raw.decode()
             except UnicodeDecodeError:
                 raise ApiError(503, f"{self.path} is not valid UTF-8")
-            lines = text.split("\n")
+            # splitlines(), not split("\n"): the parser honours EIGHT more
+            # terminators (\r, \v, \f, \x1c-\x1e, \x85, U+2028, U+2029), so a
+            # file using any of them parsed as many users here but rewrote as
+            # ONE line — silently deleting every other entry, disabled ones
+            # included, while answering 200. keepends so each line's own
+            # terminator survives byte-for-byte, as this method promises.
+            lines = text.splitlines(keepends=True)
             hit = None
             for i, line in enumerate(lines):
                 s = line.strip()
@@ -357,20 +426,28 @@ class Roster:
                      if f.strip() and f.strip().lower() != "must-change"]
             if must_change:
                 flags.append("must-change")
-            lines[hit] = self._fmt(user, display or None, flags, password_spec)
+            body = lines[hit].splitlines()[0]        # the line without its
+            term = lines[hit][len(body):]            # terminator (may be "")
+            lines[hit] = self._fmt(user, display or None, flags,
+                                   password_spec) + term
+            out = "".join(lines)
+            # a rewrite can GROW the file (a password-less line gaining a
+            # 118-char hash spec), and crossing the cap denies everyone
+            self._check_cap(len(out.encode()))
             tmp = self.path.with_name(self.path.name + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 os.fchmod(f.fileno(), 0o600)
-                f.write("\n".join(lines))
+                f.write(out)
             os.replace(tmp, self.path)
         except OSError as e:
             raise ApiError(503, f"password change unavailable: cannot write "
                                 f"{self.path} ({e.strerror or e})")
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
 
     def invalidate(self) -> dict[str, Entry]:
         """Drop the cache and re-read now — for writers that must decide on
         CURRENT contents, not on a stamp-cached view."""
-        self._cache = (object(), {}, None, 0.0)
+        self._cache = (object(), {}, None, 0.0, None)
         return self.entries()

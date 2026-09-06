@@ -61,8 +61,24 @@ class Api:
         # presence are signals that expire in seconds — writing markers for
         # them would churn the disk for state nobody should ever recover.
         self._typing_lock = threading.Lock()
-        self._typing: dict = {}      # (gid, user) -> expiry (time.time())
-        self._seen: dict = {}        # user -> last authenticated activity
+        self._typing: dict = {}      # (gid, user) -> expiry (time.monotonic())
+        # An update event is named (mid, kind, actor), so a SECOND change by
+        # the same actor collides with the first entry's symlink and queue_add
+        # swallows the FileExistsError. If that happens after we handed the
+        # entry to a client but before the client confirms it, the confirm
+        # retires an entry whose newest change the client never saw — an edit
+        # that never lands, or a "delete for everyone" that silently doesn't.
+        # So remember the link mtime we handed out; _fanout_event re-stamps
+        # the link on a collision, and confirm refuses to unlink an entry that
+        # moved on since. Bounded, and losing the table (restart, overflow)
+        # only degrades to the old behaviour.
+        self._handed_lock = threading.Lock()
+        self._handed: dict = {}      # (user, entry) -> mtime handed to a poll
+        # user -> (wall-clock seconds, monotonic seconds) of last activity.
+        # Both are needed: last_seen is REPORTED to clients (and persisted) so
+        # it must be epoch time, while "online" is an INTERVAL and must not
+        # move when the wall clock steps (see list_queue).
+        self._seen: dict = {}
         self._seen_persisted: dict = {}   # user -> last time we wrote lastseen
 
     # ---- auth --------------------------------------------------------------
@@ -92,6 +108,14 @@ class Api:
             raise ApiError(400, "bad old password")
         if not isinstance(new, str) or len(new) < 8 or len(new) > 128:
             raise ApiError(400, "new password must be 8..128 chars")
+        # The one endpoint that ran an UNLIMITED password verify. A token
+        # without its password — a laptop left unlocked, a token lifted from
+        # client storage — could guess `old` here at full speed, and the
+        # plaintext is worth more than the token (it survives session
+        # revocation and is probably reused elsewhere). Same budget as
+        # /api/login, keyed on the account; checked after the cheap 400s so a
+        # malformed body never spends it, and before the PBKDF2 it bounds.
+        self.login_limiter.check(f"pw/{user}")
         if self.store.verify_password(user, old) is None:
             raise ApiError(403, "old password wrong")
         self.store.set_password(user, new)
@@ -108,7 +132,7 @@ class Api:
         users/<u>/lastseen is written at most every LASTSEEN_PERSIST_SECS so a
         restart still knows a coarse last-seen without per-request disk churn."""
         now = time.time()
-        self._seen[user] = now
+        self._seen[user] = (now, time.monotonic())
         if now - self._seen_persisted.get(user, 0) > LASTSEEN_PERSIST_SECS:
             self._seen_persisted[user] = now
             try:
@@ -120,7 +144,7 @@ class Api:
     def _last_seen_ms(self, user: str) -> int | None:
         ts = self._seen.get(user)
         if ts:
-            return int(ts * 1000)
+            return int(ts[0] * 1000)
         try:
             return int((self.store.user_dir(user) / "lastseen").read_text())
         except (OSError, ValueError):
@@ -130,7 +154,9 @@ class Api:
         # A parked long-poll called touch_seen when it arrived and re-polls well
         # inside PRESENCE_ONLINE_SECS, so consulting the poll counter told us
         # nothing extra and coupled poll fairness to presence.
-        return time.time() - self._seen.get(user, 0) < PRESENCE_ONLINE_SECS
+        seen = self._seen.get(user)
+        return (seen is not None
+                and time.monotonic() - seen[1] < PRESENCE_ONLINE_SECS)
 
     # ---- typing (ephemeral, in-memory) --------------------------------------
     def typing(self, user: str, body: dict) -> dict:
@@ -145,7 +171,7 @@ class Api:
         # skips one indicator refresh.
         self.typing_limiter.check(user)
         with self._typing_lock:
-            now = time.time()
+            now = time.monotonic()   # a TTL is an interval — see list_queue
             for k in [k for k, exp in self._typing.items() if exp <= now]:
                 del self._typing[k]
             # cap globally AND per user: without the per-user bound one
@@ -162,9 +188,11 @@ class Api:
     def _typing_for(self, user: str) -> dict:
         """{gid: {typist: int(expiry)}} for groups `user` belongs to. The
         expiry is included so a parked poll detects a re-ping (same set, new
-        expiry) as a change and keeps the watcher's indicator alive."""
+        expiry) as a change and keeps the watcher's indicator alive. It is a
+        MONOTONIC stamp and never leaves the process — _typing_payload sends
+        names only — so it is compared, not published."""
         with self._typing_lock:
-            now = time.time()
+            now = time.monotonic()
             snapshot = [(g, u, exp) for (g, u), exp in self._typing.items()
                         if exp > now and u != user]
         out: dict = {}
@@ -182,13 +210,22 @@ class Api:
 
     # ---- queue -------------------------------------------------------------
     def list_queue(self, user: str, wait: float) -> dict:
-        deadline = time.time() + max(0.0, min(wait, MAX_WAIT))
+        # MONOTONIC, never the wall clock: this is an INTERVAL, and the wall
+        # clock steps (a VM resumed from a snapshot, timesyncd's first sync,
+        # chrony stepping an offset over 128ms). A backward step of N seconds
+        # parked every live poll for its wait PLUS N — far past MAX_WAIT —
+        # each one holding a worker thread and one of MAX_CONNECTIONS slots
+        # the whole time, which at a busy deployment turns a clock hiccup into
+        # accept-then-close for everyone. Nothing here is reported to clients,
+        # so the clock swap is invisible outside this method. (Store.next_ts
+        # is hardened against the same step for message ids.)
+        deadline = time.monotonic() + max(0.0, min(wait, MAX_WAIT))
         # First check is always cheap. Only PARKING (waiting) is capped per
         # user, so one account can't tie up unbounded worker threads by opening
         # many concurrent long-polls.
         items = self._queue_items(user)
         typing = self._typing_for(user)
-        if items or time.time() >= deadline:
+        if items or time.monotonic() >= deadline:
             return self._queue_resp(items, typing)
         with self._poll_lock:
             over = self._polls.get(user, 0) >= MAX_POLLS_PER_USER
@@ -213,9 +250,9 @@ class Api:
                 cur = self._typing_for(user)
                 # return on queue activity, deadline, or a typing-state CHANGE
                 # (start/stop/re-ping) — steady silence keeps the poll parked
-                if items or cur != typing or time.time() >= deadline:
+                if items or cur != typing or time.monotonic() >= deadline:
                     return self._queue_resp(items, cur)
-                self.notifier.wait(user, min(1.0, deadline - time.time()))
+                self.notifier.wait(user, min(1.0, deadline - time.monotonic()))
         finally:
             with self._poll_lock:
                 n = self._polls.get(user, 1) - 1
@@ -248,7 +285,10 @@ class Api:
                 if kind is None and not target.is_dir():
                     link.unlink(missing_ok=True)  # target archived/gone: drop
                     continue
-                at = int(link.lstat().st_mtime * 1000)
+                mtime = link.lstat().st_mtime
+                at = int(mtime * 1000)
+                if kind in ("u", "a"):
+                    self._hand_out(user, link.name, mtime)
             except FileNotFoundError:
                 continue
             item = {"entry": link.name,
@@ -261,6 +301,29 @@ class Api:
                 item["user"] = uid
             out.append(item)
         return out
+
+    MAX_HANDED = 20_000   # bounds the memory; past it, confirm behaves as before
+
+    def _hand_out(self, user: str, entry: str, mtime: float) -> None:
+        """Note the update entry's current stamp as a poll hands it over."""
+        with self._handed_lock:
+            if (len(self._handed) >= self.MAX_HANDED
+                    and (user, entry) not in self._handed):
+                return
+            self._handed[(user, entry)] = mtime
+
+    def _superseded(self, user: str, entry: str, link: Path) -> bool:
+        """True when a NEWER change re-stamped this update entry after a poll
+        handed it out — so confirming it now would drop a change the client
+        has never been told about (the next event for the same message and
+        actor coalesces onto this very symlink and would be swallowed)."""
+        with self._handed_lock:
+            handed = self._handed.get((user, entry))
+        return handed is not None and link.lstat().st_mtime > handed
+
+    def _forget(self, user: str, entry: str) -> None:
+        with self._handed_lock:
+            self._handed.pop((user, entry), None)
 
     def peek(self, user: str, entry: str) -> dict:
         if not MID_RE.match(entry):
@@ -333,16 +396,25 @@ class Api:
             try:
                 if not link.is_symlink():
                     continue
-                if m.group(2) is None:  # a message entry, not a flag event
+                kind = m.group(2)
+                if kind is None:        # a message entry, not a flag event
                     mdir = Path(os.path.realpath(link))
                     gid = self.store.gid_of(mdir)
                     # only stamp delivered if the user is genuinely still a
                     # member; a stale entry for a left group is just unlinked
                     if gid and mdir.is_dir() and self.store.is_member(gid, user):
                         self._stamp(mdir, user, "d")
+                elif kind in ("u", "a") and self._superseded(user, name, link):
+                    # the message changed again between the poll that handed
+                    # this entry over and this confirm: leave it queued so the
+                    # next poll redelivers it. Confirming would retire the
+                    # only carrier the later change has.
+                    continue
                 link.unlink(missing_ok=True)
+                self._forget(user, name)
                 confirmed += 1
             except FileNotFoundError:
+                self._forget(user, name)
                 continue
         return {"confirmed": confirmed}
 
@@ -365,11 +437,20 @@ class Api:
             if not self.can_see(user, gid, mid):
                 continue
             mdir = self.store.msg_dir(gid, mid)
-            sender = (mdir / "from").read_text().strip()
-            if sender == user or (mdir / "system").exists():
+            # The same guard confirm puts around the same _stamp call: with
+            # --retain-days set, the janitor can archive this message's day
+            # folder between can_see and here, and then `from`'s read (or
+            # _stamp's mkdir) raises. Without this the request 500s and every
+            # REMAINING id in the batch goes unmarked — one archived message
+            # silently costs the whole batch its read receipts.
+            try:
+                sender = (mdir / "from").read_text().strip()
+                if sender == user or (mdir / "system").exists():
+                    continue
+                if self._stamp(mdir, user, "r"):
+                    marked += 1
+            except FileNotFoundError:
                 continue
-            if self._stamp(mdir, user, "r"):
-                marked += 1
         return {"marked": marked}
 
     # ---- sending -----------------------------------------------------------
@@ -442,13 +523,23 @@ class Api:
         """Queue a payload-less ~a~/~u~ event to EVERY member (including the
         actor — their other devices need it too) and wake them. Receivers
         refetch the message state; the entry itself carries no data."""
+        entry = f"{mid}~{kind}~{actor}"
         for u in self.store.members(gid):
             # a member who joined AFTER this message can't read it, so an event
             # would only leak its existence and wedge an unresolvable entry in
             # their queue
             if int(mid[:13]) < self.store.joined_at(gid, u):
                 continue
-            self.store.queue_add(u, f"{mid}~{kind}~{actor}", mdir)
+            self.store.queue_add(u, entry, mdir)
+            # If the entry already existed (this actor's previous change is
+            # still unconfirmed) the symlink is unchanged and NOTHING on disk
+            # would say a new change happened. Re-stamp it: the queue item's
+            # `at` then reports the latest change, and confirm can tell that a
+            # client holding the older state must not retire the entry.
+            try:
+                os.utime(self.store.queue_dir(u) / entry, follow_symlinks=False)
+            except OSError:
+                pass            # the user was revoked, or their queue is gone
             self.notifier.notify(u)
 
     # ---- reactions / edit / delete ------------------------------------------
@@ -642,11 +733,26 @@ class Api:
             mime = image_mime(body[:16])
             if not mime:
                 raise ApiError(400, "thumb must be a png/jpeg/gif/webp image")
-            tmp = self.store.root / "tmp" / f"t-{fid}"
+            # A UNIQUE tmp name, and an atomic claim on the destination.
+            # The tdst.exists() check above is a cheap early out, not the
+            # guard: concurrent thumbs for one fid all passed it, all charged
+            # the quota (the counter drifted 2-5x over reality until the next
+            # hourly recount, spuriously 413ing legitimate uploads), collided
+            # on the shared tmp path so one racer's os.replace raised
+            # FileNotFoundError -> 500 instead of the documented 409, and the
+            # loser's meta could end up describing the winner's bytes — an
+            # ETag that does not match what ?thumb=1 serves. os.link fails if
+            # the name exists, so exactly one racer wins.
+            tmp = self.store.root / "tmp" / f"t-{fid}-{secrets.token_hex(8)}"
             with open(tmp, "wb") as f:
                 os.fchmod(f.fileno(), 0o600)
                 f.write(body)
-            os.replace(tmp, tdst)
+            try:
+                os.link(tmp, tdst)
+            except FileExistsError:
+                raise ApiError(409, "thumb already uploaded")
+            finally:
+                tmp.unlink(missing_ok=True)
             try:
                 meta = json.loads(metaf.read_text())
                 if not isinstance(meta, dict):
@@ -689,10 +795,14 @@ class Api:
 
     def attachment(self, user: str, gid: str, mid: str, n: str,
                    thumb: bool = False):
-        # `str.isdigit()` is True for non-ASCII digits like "¹" (superscript
-        # one), but int() then raises ValueError → 500; pin it to ASCII 0-9.
+        # Two traps, both of which end in int() raising ValueError → 500 on
+        # a path segment any authenticated user picks: `str.isdigit()` is True
+        # for non-ASCII digits like "¹" (superscript one), and a string of
+        # more than 4300 digits exceeds Python's int-conversion limit. Pin to
+        # ASCII 0-9 AND bound the length before int() sees it — MAX_ATTACHMENTS
+        # is single-digit, so three characters is already generous.
         if not (GID_RE.match(gid) and MID_RE.match(mid)
-                and n.isascii() and n.isdigit()
+                and n.isascii() and n.isdigit() and len(n) <= 3
                 and 1 <= int(n) <= MAX_ATTACHMENTS):
             raise ApiError(400, "bad attachment path")
         if not self.store.is_member(gid, user):

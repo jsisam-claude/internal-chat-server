@@ -40,6 +40,28 @@ def _reject_surrogates(obj) -> None:
             stack.extend(o)
 
 
+# Bigger than any file, small enough to stay a machine word. A range spec
+# longer than 19 digits saturates to this instead of being converted.
+_OFFSET_MAX = 1 << 63
+
+
+def _offset(s: str) -> int | None:
+    """A byte offset from a Range header, or None if it is not one.
+
+    Two guards before int(), both of which are otherwise a ValueError → 500
+    on a path whose contract (and this module's docstring, and API.md) says
+    malformed input is IGNORED: `str.isdigit()` is True for non-ASCII digits
+    like "¹", and Python refuses to convert a string of more than 4300 digits
+    (sys.get_int_max_str_digits), so `Range: bytes=<4301 nines>-` was a
+    guaranteed 500 on every attachment. Over-long specs SATURATE rather than
+    return None, so an absurd offset stays an unsatisfiable range (416) like
+    a merely-huge one, instead of silently becoming a full 200.
+    (api._parse_dims and api.attachment carry the same guard.)"""
+    if not (s.isascii() and s.isdigit()):
+        return None
+    return int(s) if len(s) <= 19 else _OFFSET_MAX
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 75  # must exceed MAX_WAIT so long-polls aren't cut off
@@ -269,6 +291,12 @@ class Handler(BaseHTTPRequestHandler):
                                    inline=inline,
                                    sha256=meta.get("sha256"))
         if p == ["client", "version"]:
+            # The ONE endpoint with no self._user(). Deliberate, and harmless:
+            # it echoes static_dir/version.json, which the static route
+            # already serves unauthenticated at /version.json, describing an
+            # APK that /download/app.apk hands to anyone. Requiring a session
+            # here would hide nothing and would break an updater that has to
+            # check before one exists. API.md §7 states the exception.
             if self.static_dir and (self.static_dir / "version.json").is_file():
                 return self._send_static(self.static_dir / "version.json")
             raise ApiError(404, "no client published")
@@ -283,8 +311,10 @@ class Handler(BaseHTTPRequestHandler):
         ranges, which we choose not to serve — is None, not an error: RFC
         9110 §14.2 lets a server ignore any Range header and a full 200 is
         always a correct answer, so this parser never needs to be clever.
-        Digits are pinned to ASCII because int("¹") raises after isdigit()
-        passes — the exact trap the attachment index hit (api.attachment)."""
+        Offsets go through _offset(), which pins them to ASCII digits AND
+        caps their length: int("¹") raises after isdigit() passes, and so
+        does a 4301-digit string (the same two traps api.attachment and
+        api._parse_dims guard)."""
         if not header or not header.startswith("bytes="):
             return None
         spec = header[6:].strip()
@@ -294,21 +324,21 @@ class Handler(BaseHTTPRequestHandler):
         if not sep:
             return None
         if not start_s:            # suffix form "bytes=-N": the last N bytes
-            if not (end_s.isascii() and end_s.isdigit()):
+            n = _offset(end_s)
+            if n is None:
                 return None
-            n = int(end_s)
             # "-0" asks for zero bytes and an empty file has no last byte:
             # both are satisfiable-by-nothing → 416, not a zero-length 206
             if n == 0 or fsize == 0:
                 return "unsat"
             return (max(fsize - n, 0), fsize - 1)
-        if not (start_s.isascii() and start_s.isdigit()):
+        start = _offset(start_s)
+        if start is None:
             return None
-        start = int(start_s)
         if end_s:
-            if not (end_s.isascii() and end_s.isdigit()):
+            end = _offset(end_s)
+            if end is None:
                 return None
-            end = int(end_s)
             if end < start:
                 return None        # last < first: invalid spec → serve full
             end = min(end, fsize - 1)
@@ -515,8 +545,16 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     spawned — so a flood (including slowloris clients that dribble headers and
     would otherwise each hold a thread + FD) can't exhaust threads/FDs. Excess
     connections are closed immediately; the semaphore is released when the
-    connection's thread finishes. This is the real thread/FD bound; put a
-    reverse proxy in front for production-grade connection limiting."""
+    connection's thread finishes. This is the real thread/FD bound.
+
+    A reverse proxy in front gives production-grade connection limiting, but
+    note what it does to the LOGIN caps: api.login is keyed on
+    client_address[0], so terminating TLS/TCP upstream (or reaching this
+    server across a NAT gateway) collapses every user onto one limiter key and
+    turns LOGIN_IP_LIMIT into a company-wide 60-per-5-minutes admission gate.
+    Raise it for any shared-egress deployment — and do NOT reach for
+    X-Forwarded-For unless a trusted-proxy allowlist comes with it, since an
+    unauthenticated header would let every client pick its own limiter key."""
     max_connections = MAX_CONNECTIONS
 
     def __init__(self, *a, **k):

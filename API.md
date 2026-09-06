@@ -1,20 +1,25 @@
 # internal-chat — Client/Server API
 
 Everything is JSON over HTTPS except file bytes. All endpoints except
-`POST /api/login` require `Authorization: Bearer <token>`. Errors are
-`{"error": "<message>"}`. Status codes: 400 (bad input, incl. duplicate
-file id), 401 (no/expired session), 403 (not a member / wrong password),
-404 (not found / pre-join), 413 (file too big or per-user storage quota
-exceeded, 2 GB), 429 (rate-limited: login, send, upload, group ops), 503
-(server at its connection cap, or a transient send-claim collision — retry),
-500 (server bug). `confirm` and `viewed` process at most 500 ids per call,
-so clients must chunk larger batches (the server silently ignores the
-overflow otherwise).
+`POST /api/login` and `GET /api/client/version` (§7) require
+`Authorization: Bearer <token>`. Errors are `{"error": "<message>"}`. Status
+codes: 400 (bad input, incl. duplicate file id), 401 (no/expired session),
+403 (not a member / wrong password / not your message), 404 (not found /
+pre-join), 409 (already claimed — a second thumb for one staged file), 413
+(file too big or per-user storage quota exceeded, 2 GB), 429 (rate-limited:
+login, password change, send/react/edit/delete, upload, group ops, search,
+starred, typing), 503 (server at its connection cap, a transient send-claim
+collision, or the user file cannot be written — retry), 507 (a write would
+push the user file past its size cap, see §1), 500 (server bug). `confirm`
+and `viewed` process at most 500 ids per call, so clients must chunk larger
+batches (the server silently ignores the overflow otherwise); one poll
+returns at most 500 queue entries, so a backlog drains over several polls.
 
 The one rule that shapes everything: **a client learns things only through
 its queue** (`GET /api/messages`). New messages, delivered ticks, read ticks,
-send failures, and group lifecycle all arrive there; every other GET is for
-(re)building state from the truth (group folders), never for noticing change.
+message changes (reaction/edit/delete), send failures, and group lifecycle
+all arrive there; every other GET is for (re)building state from the truth
+(group folders), never for noticing change.
 
 ## 1. Session
 
@@ -24,8 +29,19 @@ send failures, and group lifecycle all arrive there; every other GET is for
 | `POST /api/logout` | → `{"ok":true}` (invalidates this token) |
 | `POST /api/password` | `{"old","new"}` → `{"ok":true}` — kills every *other* session |
 
-Login is rate-limited per IP+user (10 / 5 min → 429). If `must_change` is
-true, the client must show the password-change screen before anything else.
+Login is rate-limited per IP+user (10 / 5 min → 429) **and** per source IP
+(60 / 5 min). `POST /api/password` shares the per-user budget (10 / 5 min):
+checking `old` is a full password verify, so it is guessable at speed by
+anyone holding a token but not the password. If `must_change` is true, the
+client must show the password-change screen before anything else.
+
+> The "source IP" is the **TCP peer**. Terminate TLS at a reverse proxy, or
+> reach the server across a NAT gateway, and every client collapses onto one
+> limiter key — the 60/5min cap then applies to the whole company at once
+> (a rollout or a Monday-morning login wave hits it). Raise `LOGIN_IP_LIMIT`
+> in `config.py` for any shared-egress deployment. The server deliberately
+> does **not** read `X-Forwarded-For`: an unauthenticated header would let
+> every client pick its own limiter key and switch the defence off.
 
 ### The user file — identity, flags, password
 
@@ -67,15 +83,30 @@ from day zero, their queue materialising with the first message.
 * A denied login answers with the same `401 bad credentials` as a wrong
   password, with **flat timing** across every failure shape (unknown name,
   password-less entry, malformed hash, wrong password, disabled — the
-  disabled check runs *after* the hash).
+  disabled check runs *after* the hash). The work spent on a shape with no
+  hash to check is calibrated to the iteration count *this file* uses, so
+  raising `PBKDF2_ITERS` before everyone has changed their password does not
+  make an unknown username measurably slower than a known one.
 * The server **rewrites the file** when a user changes their password
   (`POST /api/password`): exactly one line changes, atomically, under
-  `<path>.lock`; comments and other lines survive byte-for-byte. A file the
-  service cannot write is a valid hardening stance — logins keep working
-  and self-service changes answer `503`. Since the file now holds hashes,
-  keep it `0600` (the CLI creates it that way). Edit it **atomically**
-  (write a temp file and `rename`) — a truncate-in-place rewrite can be
-  read half-written, which denies until it completes.
+  `<path>.lock`; comments, other lines, and each line's own terminator
+  survive byte-for-byte. A file the service cannot write is a valid
+  hardening stance — logins keep working and self-service changes answer
+  `503`. What enforces that stance is an unwritable **directory** (both the
+  lock and the atomic replace create files in it); a read-only `passwd`
+  inside a writable directory is simply replaced. Since the file holds
+  hashes, keep it `0600` (the CLI creates it that way).
+* Edit it **atomically** (write a temp file and `rename`). A
+  truncate-in-place rewrite can be read half-written, and the outcome is not
+  always the safe one: a read landing mid-line usually denies, but a line cut
+  inside its `flags` field (`carol:Carol:`) parses as a valid, *not-disabled*
+  entry — so an in-place edit can briefly **grant** the very account it is
+  revoking.
+* The file is capped at **1 MiB** (`MAX_ROSTER_BYTES` in `roster.py`) — about
+  7,400 users at a typical hashed line. Past the cap it is unreadable, which
+  denies **everyone**, so `adduser` and the admin `passwd` refuse with `507`
+  rather than write the line that would cross it. Raise the constant (and
+  restart) if you genuinely need more.
 
 **What removal does and does not do.** It stops the account *connecting*
 and hides it from the directory, so it cannot be DM'd by name or added to
@@ -93,14 +124,20 @@ preserved, so nobody's password changes.
 ### `GET /api/messages?wait=25`
 
 Long-polls up to `wait` seconds (max 30) if the queue is empty; returns
-immediately otherwise.
+immediately otherwise. The response may also carry `"typing"` —
+`{"<gid>": ["bob", …]}`, everyone currently typing in a group you are in,
+excluding yourself. It is ephemeral in-memory state, not a queue entry:
+nothing to confirm, and an ABSENT or empty `typing` clears every indicator. A
+parked poll also returns early when the typing set changes, so indicators are
+live without a second connection.
 
 ```json
 {"queue": [
   {"entry":"1784…9f2a",          "kind":"msg",       "id":"1784…9f2a", "gid":"d-alice-bob", "at":1784070365969},
   {"entry":"1784…11aa~d~bob",    "kind":"delivered", "id":"1784…11aa", "gid":"d-alice-bob", "user":"bob", "at":…},
   {"entry":"1784…11aa~r~bob",    "kind":"read",      "id":"1784…11aa", "gid":"d-alice-bob", "user":"bob", "at":…},
-  {"entry":"1784…77cc~x~server", "kind":"failed",    "id":"1784…77cc", "gid":null, "user":"server", "at":…}
+  {"entry":"1784…77cc~x~server", "kind":"failed",    "id":"1784…77cc", "gid":null, "user":"server", "at":…},
+  {"entry":"1784…3b7e~u~bob",    "kind":"updated",   "id":"1784…3b7e", "gid":"g-9c9fe43a", "user":"bob", "at":…}
 ]}
 ```
 
@@ -109,6 +146,25 @@ immediately otherwise.
   sent; update ticks, then confirm (nothing to fetch — the entry is the data).
 - `kind:"failed"` — message `id` I sent could not be routed; mark the bubble
   failed (retry = fresh send with a fresh nonce), then confirm.
+- `kind:"updated"` — message `id` CHANGED: `user` reacted to it, edited it,
+  or deleted it for everyone. The entry carries no payload — refetch with
+  `GET /api/message/state/<gid>/<mid>`, re-render (text, reactions,
+  `edited`, `deleted`, attachments), then confirm. `at` is when the latest
+  change happened.
+
+**Confirm every entry you are handed** — including kinds you do not
+recognise, and entries whose fetch fails permanently (a 4xx: the message is
+gone, or was never visible to you). An unconfirmed entry stays in the queue,
+and `GET /api/messages` returns *immediately* while the queue is non-empty:
+one entry a client never confirms turns its long-poll into a hot loop at full
+request rate, and past 500 stuck entries newer messages stop appearing at all.
+
+Confirming an `updated` entry that changed **again** since the poll handed it
+to you is deliberately a no-op: the server keeps it queued so the newer change
+still reaches you, and `{"confirmed": n}` comes back smaller than the number
+of entries you sent. That is not an error — re-poll, refetch the state, and
+confirm again. (Repeat changes by one actor share a single queue entry, so
+retiring it early is how an edit or a "delete for everyone" would be lost.)
 
 ### `GET /api/message/dequeue/<msg-id>` — peek
 
@@ -118,18 +174,31 @@ after a crash. 404 if the id isn't in *your* queue.
 ```json
 {"id":"1784…9f2a", "gid":"d-alice-bob", "from":"alice", "at":1784070365969,
  "text":"see attached",
- "attachments":[{"n":1,"name":"report.pdf","size":48211,"sha256":"…",
-                 "image":"image/png"}],   // "image" only on verified images
+ "attachments":[{"n":1,"name":"clip.mp4","size":48211,"sha256":"…",
+                 "video":"video/mp4",     // at most ONE of image/audio/video
+                 "thumb":true,            // a preview exists: fetch ?thumb=1
+                 "w":1280,"h":720}],      // the ORIGINAL's pixel size
  "recipients":["bob"],                    // members at SEND time (see below)
  "deliveredto":{}, "readby":{},
+ "reactions":{"bob":"👍"},                 // omitted when there are none
+ "edited":1784070999123,                  // only if edited (server stamp)
+ "deleted":true,                          // tombstone: text "", no attachments
+ "reply":{"id":"1784…11aa","from":"bob","text":"first 160 chars…"},
  "system":{"event":"join","user":"carol","by":"alice"}}   // only on announcements
 ```
+
+Every field after `readby` is present only when it applies. A `reply` stub is
+resolved at READ time, so it tracks its target: `{"id","deleted":true}` when
+the quoted message was deleted, `{"id","gone":true}` when it was archived or
+is invisible to you. This is the same body `GET /api/message/state` and
+`history` return.
 
 **`recipients`** is the set of members who had joined by the time this message
 was sent (excluding the sender). Aggregate ticks over THIS set, not the live
 roster — a member added later is not a recipient of older messages, so
 `recipients` keeps their ✓✓/read state from regressing. `history` returns it
-too. **`image`** on an attachment is the server-verified mime (see §3).
+too. **`image`/`audio`/`video`** on an attachment is the server-verified mime
+(see §3).
 
 ### `POST /api/message/dequeue/read/<entry>[,<entry>…]` — confirm
 
@@ -154,7 +223,8 @@ system announcements. Stamps `readby/<me>` and queues `~r~` events.
  "gid":"g-9c9fe43a",    // …or an explicit group (exactly one of to/gid)
  "text":"hello",
  "nonce":"c0ffee-4b1d…",     // client-random, 8..64 chars — retry dedup key
- "files":["3f9c…"]}          // optional staged file_ids, max 8
+ "files":["3f9c…"],          // optional staged file_ids, max 8
+ "reply_to":"1784…11aa"}     // optional: quote a message you can see
 → {"id":"1784…9f2a", "gid":"d-alice-bob"}
 ```
 
@@ -165,24 +235,43 @@ Ticks then arrive via the queue: `~d~` from each recipient (✓✓ when all),
 ### `POST /api/files` — stage an upload
 
 Raw request body (no multipart). Headers: `Content-Length` (≤ 50 MB),
-`X-File-Name: report.pdf` (metadata only — never becomes a path).
+`X-File-Name: report.pdf` (metadata only — never becomes a path), and
+optionally `X-Media-Kind: audio`.
 
-→ `{"file_id":"3f9c…","name":"report.pdf","sha256":"…","image":"image/png"}`
+→ `{"file_id":"3f9c…","name":"note.m4a","sha256":"…","audio":"audio/mp4"}`
 — then reference in `files` on send. Staged uploads expire after 24 h; at most
-16 pending. **`image`** is present only when the server verified the bytes are
-a safe-to-render image (png/jpeg/gif/webp) by their **magic bytes** — never by
-the filename. It is the *only* thing that unlocks inline rendering, and it is
-echoed on each attachment in `render_msg` output.
+16 pending. The response carries **at most one of `image` / `audio` /
+`video`**, set only where the server recognised the bytes themselves — their
+**magic bytes**, never the filename — as a safe-to-render container:
+
+| field | verified types |
+|---|---|
+| `image` | `image/png`, `image/jpeg`, `image/gif`, `image/webp` |
+| `audio` | `audio/mpeg`, `audio/ogg`, `audio/webm`, `audio/mp4` |
+| `video` | `video/webm`, `video/mp4`, `video/quicktime`, `video/3gpp`, `video/3gpp2` |
+
+One of those three is what unlocks inline rendering, and each is echoed on the
+attachment in every message render. Anything else (PDF, SVG, HEIC/AVIF stills,
+archives, unknown bytes) carries none of them and is a forced download.
+
+`X-Media-Kind: audio` is a **presentation-only** hint from a client that
+recorded the bytes. WebM and ISO-BMFF are containers that can hold either
+audio or video, and telling them apart means parsing a track header, which the
+server will not do — so they default to `video`, and this header narrows an
+already-verified one to `audio` (a voice note). It can never make a non-media
+file inline-eligible, change the container served, or produce a scriptable
+type; worst case a user mislabels their own message.
 
 ### `GET /api/attachments/<gid>/<mid>/<n>[?inline=1]` — download / view
 
 Membership-checked. By default `application/octet-stream` +
 `Content-Disposition: attachment` + `nosniff` — a forced download.
 
-`?inline=1` returns the image inline (its verified `image/*` type,
-`Content-Disposition: inline`) **only if** the server flagged the attachment
-as a verified image at upload; otherwise the flag is ignored and the response
-stays a forced octet-stream download. Every attachment response carries
+`?inline=1` serves the bytes under their verified type with
+`Content-Disposition: inline` **only if** the server flagged the attachment as
+verified `image`, `audio` or `video` at upload (the table above); for anything
+else the flag is ignored and the response stays a forced octet-stream
+download. Every attachment response carries
 `Cross-Origin-Resource-Policy: same-origin`; inline responses additionally
 carry `Content-Security-Policy: default-src 'none'; sandbox`, so the bytes
 can never act as a document or run script even if a client dereferenced them
@@ -224,17 +313,41 @@ downloads (mismatch → full `200`). `HEAD` works on every GET endpoint and
 returns the same headers — including the true `Content-Length` — with no
 body.
 
-## 4. Conversations & directory
+## 4. Message actions
+
+Everything here is authorized by the same visibility predicate as a read: a
+member of the group, a message that exists, and not from before you joined —
+otherwise `403`/`404`. All of them are rate-limited (`429`).
+
+| Endpoint | Body → Response |
+|---|---|
+| `POST /api/message/react` | `{"gid","mid","emoji":"👍"}` → `{"ok":true,"reactions":{…}}`. An empty/omitted `emoji` REMOVES yours. One reaction per user per message; ≤ 16 codepoints, printable. `400` on a system or deleted message. |
+| `POST /api/message/edit` | `{"gid","mid","text"}` → `{"ok":true,"edited":<ms>}`. Sender only (`403`), never a system or deleted message. |
+| `POST /api/message/delete` | `{"gid","mid"}` → `{"ok":true}` — delete **for everyone**. Sender only. Idempotent. Blanks the text, drops reactions and attachment bytes (crediting the quota back) and leaves a tombstone, so replies and history still render a coherent stub. |
+| `POST /api/message/star` | `{"gid","mid","on":true}` → `{"ok":true,"starred":true}` — private, no fan-out, max 1000 per user (`429`). |
+| `GET /api/starred` | `{"messages":[…]}` newest first, up to 200 full renders. Self-healing: markers whose message is gone (or whose group you left) are pruned as they are met. |
+| `GET /api/search?q=&gid=&limit=20` | `{"results":[{"id","gid","from","at","snippet"}],"truncated":bool}` — case-insensitive substring over message text and attachment names, newest first, across every group you are in (or one `gid`). `q` is 1..256 chars; `limit` ≤ 50. |
+| `POST /api/typing` | `{"gid"}` → `{"ok":true}` — fire-and-forget; re-ping every ~3 s while the user types. Delivered as the `typing` field of other members' polls (§2), never as a queue entry. A `429` just skips one refresh. |
+
+React, edit and delete each fan a `kind:"updated"` entry out to every member
+who can see the message — **including the actor's other devices** — so that is
+how a second device learns about them.
+
+**`truncated`** on a search means the scan hit its work cap (4000 message
+directories) before history was exhausted: there may be older matches. Say so
+in the UI — reporting "no results" for a truncated scan is wrong.
+
+## 5. Conversations & directory
 
 | Endpoint | Response |
 |---|---|
-| `GET /api/groups` | `{"groups":[{"gid","name","members",` `"last":{"id","at","from","text","attachments"}}]}` — sidebar, sorted by activity |
+| `GET /api/groups` | `{"groups":[{"gid","name","members",` `"last":{"id","at","from","text","attachments","deleted"}}]}` — sidebar, sorted by activity |
 | `GET /api/groups/<gid>` | `{"gid","name","members","joined_at"}` — resolve a gid learned from an announcement |
-| `GET /api/groups/<gid>/messages?before=<mid>&limit=50` | `{"messages":[…]}` newest-first, full flag maps; pre-join history excluded |
-| `GET /api/message/state/<gid>/<mid>` | `{"deliveredto":{"bob":ts,…},"readby":{…}}` — "message info" screen |
-| `GET /api/users` | `{"users":[{"user","display"}]}` — new-chat picker |
+| `GET /api/groups/<gid>/messages?before=<mid>&limit=50` | `{"messages":[…]}` newest-first (`limit` ≤ 200), full renders; pre-join history excluded |
+| `GET /api/message/state/<gid>/<mid>` | the **full message render** — the same body dequeue returns (§2), not just the flag maps: text, attachments, reactions, `edited`/`deleted`, `deliveredto`/`readby`. This is what a `kind:"updated"` entry tells you to refetch, and what the "message info" screen reads. |
+| `GET /api/users` | `{"users":[{"user","display","online","last_seen"}]}` — new-chat picker. `online` is true when the account made an authenticated request in the last 60 s; `last_seen` is epoch ms and is absent for an account that has never been seen. |
 
-## 5. Groups
+## 6. Groups
 
 | Endpoint | Body → Response |
 |---|---|
@@ -246,7 +359,7 @@ Both are **announced in-band**: a system message (`"system":{"event":
 other clients learn the group exists or changed. Members can add anyone and
 remove only themselves. Leaving ends access and sweeps the leaver's queue.
 
-## 6. Distribution
+## 7. Distribution
 
 | Endpoint | Purpose |
 |---|---|
@@ -254,7 +367,13 @@ remove only themselves. Leaving ends access and sweeps the leaver's queue.
 | `GET /api/client/version` | `{version_code, sha256, url}` for APK self-update |
 | `GET /download/app.apk` | the sideload APK (via the static dir) |
 
-## 7. The client loop, end to end
+`GET /api/client/version` is the **one endpoint that needs no Bearer token**,
+deliberately: it echoes `version.json` out of the static directory, which the
+static route already serves unauthenticated at `/version.json`, describing an
+APK that `/download/app.apk` hands to anyone. Requiring a session would hide
+nothing and would break an updater that must check before it has one.
+
+## 8. The client loop, end to end
 
 ```
 login ─► GET /api/groups ─► GET …/messages per open chat   (rebuild truth)
@@ -266,6 +385,8 @@ login ─► GET /api/groups ─► GET …/messages per open chat   (rebuild tr
           delivered → tick ✓✓ when all members present → confirm
           read      → tick blue when all members present → confirm
           failed    → mark bubble failed → confirm
+          updated   → GET /api/message/state/<gid>/<mid> → re-render → confirm
+          (anything else) → confirm anyway; never leave an entry queued
         (conversation on screen? → POST /api/message/viewed for visible ids)
 
 send:  [POST /api/files]* → POST /api/messages   (outbox until 200, then ✓)
@@ -285,9 +406,16 @@ cross-reference this section):
   constant-offset magic-byte comparison (util.py) and nothing more. Every
   media parser added server-side is remote attack surface reachable by any
   authenticated user's uploaded bytes.
+- **The inline surface is exactly the three allowlists in §3** — four raster
+  image types, four audio containers, five video containers — each recognised
+  by constant-offset magic bytes. `X-Media-Kind` only chooses how an
+  already-verified ambiguous container is presented; it can never add to this
+  set. Every inline response still carries `nosniff` and the sandbox CSP.
 - **SVG is never inline.** It is scriptable XML; whatever its filename or
   the `inline` flag says, it is served only as a forced
-  `application/octet-stream` download.
+  `application/octet-stream` download. HEIC/AVIF are recognised as still
+  images inside the ISO-BMFF family precisely so they are *not* mistaken for
+  playable video — they are downloads too.
 - **PDF is never inline, even sandboxed.** PDF viewers are their own
   script-capable document surface, and a sandbox CSP does not reliably reach
   plugin/viewer contexts — PDFs stay forced downloads.

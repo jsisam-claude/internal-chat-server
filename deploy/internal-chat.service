@@ -10,6 +10,12 @@ Group=internal-chat
 # rewrites one line on a self-service password change). To FORBID
 # self-service changes, keep it root-owned in /etc and point at it:
 #     --roster /etc/internal-chat/passwd \
+# What forbids the write is the root-owned DIRECTORY (plus ProtectSystem=
+# strict below, which leaves /etc read-only for this service): the lock and
+# the atomic replace both create files there. A read-only passwd FILE inside
+# a writable directory is simply replaced, so it hardens nothing. With the
+# directory locked down, POST /api/password answers 503 and logins keep
+# working. Bootstrap it with: chatserver.py adduser <u> --roster <path>.
 # An unreadable or absent file denies every login rather than failing open.
 ExecStart=/usr/bin/python3 /opt/internal-chat/chatserver.py serve \
     --data /var/lib/internal-chat \

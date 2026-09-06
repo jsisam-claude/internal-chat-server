@@ -60,6 +60,36 @@ python3 chatserver.py serve --data /var/lib/internal-chat \
 Without `--cert` the server speaks plain HTTP and prints a loud warning —
 dev use only.
 
+## Users
+
+**One passwd-style file is the entire user database** — `<data>/passwd`, or
+wherever `--roster` points. One line per user, the password hash as the last
+field; the format, flags and login semantics are in `API.md` ("The user
+file"). What an operator needs on one screen:
+
+- `chatserver.py adduser <u>` appends a line — and creates the file, mode
+  0600, if it is not there yet. That is the whole of provisioning; the
+  account's folders appear on first contact.
+- The file is **authoritative and hot-reloaded**: add a line and they can log
+  in on the next request; remove one and they are cut off within ~1 s,
+  including sessions already logged in. **No file means no users**, and every
+  unreadable state (FIFO, directory, symlink loop, non-UTF-8, oversized,
+  unknown flag on a line) denies *everyone* rather than guessing.
+- Edit it **atomically** (write a temp file, `rename` over it). A
+  truncate-in-place rewrite can be read half-written, and a line cut inside
+  its flags field parses as an *enabled* entry — so an in-place edit can
+  briefly grant the very account it is revoking.
+- It is capped at **1 MiB** (~7,400 hashed lines). Past the cap the file is
+  unreadable and nobody can log in, so `adduser`/`passwd` refuse to write the
+  line that would cross it instead of bricking the deployment.
+- Hardening option: put it somewhere the service can only read
+  (`--roster /etc/internal-chat/passwd` with a root-owned *directory*) —
+  logins keep working and self-service password changes answer 503. A
+  read-only *file* in a writable directory hardens nothing: the atomic
+  replace still succeeds.
+- `chatserver.py roster` prints the file against the on-disk accounts. It is
+  the first thing to run when nobody can log in.
+
 ## Tests
 
 ```bash
@@ -88,6 +118,7 @@ data/
 │                                   #   (~d~ delivered, ~r~ read, ~x~ bounced,
 │                                   #    ~a~ reaction, ~u~ edited/deleted)
 ├── users/<u>/{staged,nonces,sessions,starred}   # auto-provisioned on first contact
+├── users/<u>/{storage_used,lastseen}  # quota cache; coarse last-activity stamp
 ├── groups/<gid>/members/<u>        # roster = marker files
 ├── groups/<gid>/<date>/<msg-id>/   # message.txt, from, attachments/,
 │                                   # deliveredto/<u>, readby/<u>,
@@ -96,8 +127,11 @@ data/
 └── {tmp,archive,rejected}/
 ```
 
-Ephemeral signals (typing, online presence) deliberately live in server
-memory only — they expire in seconds and are never written to disk. Search
+Typing indicators live in server memory only — they expire in seconds and are
+never written to disk. Presence is memory-authoritative the same way, with one
+exception worth knowing about for backups, retention and data-subject
+requests: a coarse `users/<u>/lastseen` (epoch ms) is written at most every 5
+minutes, so a restart still knows roughly when someone was last active. Search
 (`GET /api/search?q=`) is a bounded, newest-first walk of the same folders.
 
 A message's tick state is literally `ls`:
@@ -114,3 +148,7 @@ readby:      bob        # ✓✓ read (mtime = when)
 - Suggested systemd hardening: `ProtectSystem=strict`, `NoNewPrivileges=yes`,
   `ReadWritePaths=<data dir>`, `PrivateTmp=yes`.
 - Back up by snapshotting/rsyncing `data/` — it's only files.
+- The login rate limits key on the **TCP peer**. If you terminate TLS at a
+  reverse proxy or reach the server across a NAT gateway, every user shares
+  one key and `LOGIN_IP_LIMIT` (60 / 5 min, `config.py`) becomes a
+  company-wide cap on new sign-ins — raise it for that topology.

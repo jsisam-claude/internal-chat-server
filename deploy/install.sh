@@ -68,8 +68,11 @@ chmod 0700 "$DATA"
 # The user file lives in the data dir and is rewritten by the server when a
 # user changes their password, so it stays service-owned and private (it
 # holds password hashes). Hardening option: move it somewhere the service
-# can only READ (--roster /etc/internal-chat/passwd, root-owned) — logins
-# keep working and self-service password changes answer 503.
+# can only READ (--roster /etc/internal-chat/passwd, in a root-owned
+# DIRECTORY — a read-only file in a writable directory is just replaced by
+# the atomic rewrite) — logins keep working and self-service password
+# changes answer 503. `chatserver.py adduser --roster <path>` creates that
+# file on the first user, so it needs no touch beforehand.
 if [ -f "$DATA/passwd" ]; then
     chown "$SVCUSER:$SVCUSER" "$DATA/passwd"
     chmod 0600 "$DATA/passwd"

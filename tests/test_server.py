@@ -2493,5 +2493,393 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(st, 200)
 
 
+    # ---- regressions from the third adversarial audit -----------------------
+
+    def test_102_roster_writers_refuse_to_cross_the_size_cap(self):
+        # MAX_ROSTER_BYTES is fail-CLOSED for the reader, so a writer that
+        # crosses it does not merely fail to help: it denies every user, from
+        # an `adduser` that printed success and exited 0.
+        from internalchat.errors import ApiError
+        from internalchat.roster import MAX_ROSTER_BYTES, make_hash
+        tmp = tempfile.mkdtemp(prefix="chat-roster-cap-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pw = chatserver.Path(tmp) / "passwd"
+        spec = make_hash("pw-filler", 1000)
+        with open(pw, "w") as f:
+            n = 0
+            while f.tell() < MAX_ROSTER_BYTES - 4096:
+                f.write(f"u{n:07d}:::{spec}\n")
+                n += 1
+            f.write("ghost\n")            # a password-less entry (no hash yet)
+            # a comment leaving less headroom than any real line needs
+            f.write("#" + "x" * (MAX_ROSTER_BYTES - f.tell() - 42) + "\n")
+        size, store = pw.stat().st_size, chatserver.Store(tmp, iters=1000)
+        listed = len(store.roster.entries())
+        self.assertGreater(listed, 100)
+        self.assertIsNotNone(store.verify_password("u0000000", "pw-filler"))
+        with self.assertRaises(ApiError) as cm:      # the append path
+            store.add_user("zoe", "pw-zoe-123")
+        self.assertEqual(cm.exception.status, 507)
+        with self.assertRaises(ApiError) as cm:      # and the rewrite path:
+            store.set_password("ghost", "pw-ghost-1")  # +118 chars of hash
+        self.assertEqual(cm.exception.status, 507)
+        # refused means UNTOUCHED: the file still parses and everyone still
+        # logs in, which is the whole point of refusing
+        self.assertEqual(pw.stat().st_size, size)
+        store.roster.invalidate()
+        self.assertIsNone(store.roster.error)
+        self.assertEqual(len(store.roster.entries()), listed)
+        self.assertIsNotNone(store.verify_password("u0000000", "pw-filler"))
+
+    def test_103_an_unwritable_user_file_answers_503_not_500(self):
+        # API.md and deploy/install.sh both promise 503 for a user file the
+        # service cannot write. The sidecar lock lives in the same directory,
+        # and its open() sat OUTSIDE the try that maps failures to 503, so the
+        # documented hardening stance produced a 500 + traceback instead.
+        from internalchat.errors import ApiError
+        store, port, pw = self.roster_server(self.pwline("ra") + "\n")
+        lock = chatserver.Path(str(pw) + ".lock")
+        lock.unlink(missing_ok=True)
+        lock.mkdir()      # unopenable for any uid — no privilege trick needed
+        self.addCleanup(lock.rmdir)
+        st, body = self.rlogin(port, "ra")
+        self.assertEqual(st, 200, body)              # logins keep working…
+        st, body = self.rreq(port, "POST", "/api/password", token=body["token"],
+                             body={"old": "pw-ra", "new": "pw-ra-new-1"})
+        self.assertEqual(st, 503, body)              # …and the change is 503
+        self.assertIn("cannot write", body["error"])
+        with self.assertRaises(ApiError) as cm:      # the CLI writers too
+            store.add_user("rb", "pw-rb-123")
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_104_a_backward_clock_step_does_not_extend_intervals(self):
+        # Every interval in the park path is measured on the MONOTONIC clock.
+        # On the wall clock a VM snapshot resume or an NTP step back parked
+        # polls for the step's whole length — each holding a worker thread and
+        # one of MAX_CONNECTIONS slots — and froze rate-limit windows for just
+        # as long ("too many attempts" for an hour, to a user who did nothing).
+        import time as _time
+        import internalchat.api as apimod
+        import internalchat.ratelimit as rlmod
+        from internalchat.errors import ApiError
+
+        class Stepped:          # only the WALL clock moves; monotonic is real
+            offset = 0.0
+            def time(self):     return _time.time() + self.offset
+            def monotonic(self): return _time.monotonic()
+            def sleep(self, n):  _time.sleep(n)
+
+        clock = Stepped()
+        self.addCleanup(setattr, apimod, "time", _time)
+        self.addCleanup(setattr, rlmod, "time", _time)
+        apimod.time = rlmod.time = clock
+        self.fresh("t104")
+        took = []
+
+        def poll():
+            t0 = _time.monotonic()
+            self.api.list_queue("t104", 2.0)
+            took.append(_time.monotonic() - t0)
+
+        th = threading.Thread(target=poll)
+        th.start()
+        _time.sleep(0.4)
+        clock.offset = -3600.0            # an hour backwards, mid-poll
+        th.join(30)
+        self.assertFalse(th.is_alive(), "the poll never came back")
+        self.assertLess(took[0], 10.0, "the poll parked far past its deadline")
+        lim = rlmod.RateLimiter(limit=2, window=0.5)
+        lim.check("k")
+        lim.check("k")
+        with self.assertRaises(ApiError):
+            lim.check("k")
+        clock.offset = -7200.0            # steps again while the key is full
+        _time.sleep(0.7)                  # the real window has now elapsed
+        lim.check("k")                    # so the key must be admitted again
+
+    def test_105_viewed_survives_a_message_vanishing_mid_batch(self):
+        # confirm has guarded this since day one; viewed made the identical
+        # _stamp call unguarded, so a retention archive landing mid-request
+        # 500'd and left every id AFTER the failing one unmarked.
+        self.fresh("t105a", "t105b")
+        mids, gid = [], None
+        for i in range(2):
+            sent = self.send_msg("t105a", f"m{i}", to="t105b")
+            gid = sent["gid"]
+            mids.append(sent["id"])
+        for mid in mids:
+            self.poll_until("t105b", lambda e, m=mid: e["id"] == m)
+        victim = self.store.msg_dir(gid, mids[0])
+        parked = chatserver.Path(self.tmp) / "archive" / "t105-parked"
+        parked.parent.mkdir(parents=True, exist_ok=True)
+        orig = self.api.can_see
+
+        def racing(user, g, m):
+            ok = orig(user, g, m)
+            if m == mids[0] and victim.is_dir():
+                shutil.move(str(victim), str(parked))   # what the janitor does
+            return ok
+
+        self.api.can_see = racing
+        self.addCleanup(self.api.__dict__.pop, "can_see", None)
+        status, body = self.req("POST", "/api/message/viewed", user="t105b",
+                                body={"gid": gid, "ids": mids})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["marked"], 1)     # the survivor still got marked
+        self.assertTrue((self.store.msg_dir(gid, mids[1])
+                         / "readby" / "t105b").exists())
+
+    def test_106_one_failing_recipient_does_not_drop_the_rest(self):
+        # ENOSPC/EDQUOT on ONE queue aborted the whole fan-out: every member
+        # after them in the sorted list lost the message too, `.routed` was
+        # never written, and the log said the message had been REJECTED when
+        # it was in fact stored and readable.
+        import errno
+        self.fresh("t106a", "t106b", "t106z")
+        status, g = self.req("POST", "/api/groups", user="t106a",
+                             body={"name": "fan", "members": ["t106b", "t106z"]})
+        self.assertEqual(status, 200, g)
+        gid = g["gid"]
+        for u in ("t106b", "t106z"):     # drain the creation announcement
+            ann = self.poll_until(u, lambda e: e["kind"] == "msg")
+            self.confirm(u, [ann["entry"]])
+        real, blocked = os.symlink, str(self.store.queue_dir("t106b"))
+
+        def flaky(src, dst, **kw):
+            if blocked in str(dst):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(src, dst, **kw)
+
+        self.addCleanup(setattr, os, "symlink", real)
+        os.symlink = flaky
+        try:
+            mid = self.send_msg("t106a", "fan-out", gid=gid)["id"]
+            # t106z sorts AFTER the failing t106b, and used to lose it too
+            self.poll_until("t106z", lambda e: e["id"] == mid)
+            mdir = self.store.msg_dir(gid, mid)
+            self.assertFalse((mdir / ".routed").exists(),
+                             ".routed must not claim a finished fan-out")
+            self.assertFalse((self.store.queue_dir("t106b") / mid).exists())
+            # nothing was bounced: the message IS stored, so calling it
+            # rejected (and queueing a ~x~ to the sender) would be a lie
+            self.assertEqual(list((self.store.root / "rejected").iterdir()), [])
+        finally:
+            os.symlink = real
+        self.router.wake.set()          # the disk recovers: the retry heals it
+        self.poll_until("t106b", lambda e: e["id"] == mid)
+        self.assertTrue((self.store.msg_dir(gid, mid) / ".routed").exists())
+
+    def test_107_absurdly_long_digit_strings_are_not_500s(self):
+        # Python 3.11 refuses int() on more than 4300 digits. Both the Range
+        # parser and the attachment index take digit strings straight off the
+        # wire, on a path whose contract says malformed input is ignored.
+        self.fresh("t107a", "t107b")
+        up = self.upload("t107a", b"A" * 1024, "blob.bin")
+        sent = self.send_msg("t107a", "big", to="t107b", files=[up["file_id"]])
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t107b", lambda e: e["id"] == mid)
+        path = f"/api/attachments/{gid}/{mid}/1"
+        for hdr in ("bytes=" + "9" * 4301 + "-", "bytes=0-" + "9" * 4301,
+                    "bytes=-" + "9" * 4301, "bytes=" + "9" * 9000 + "-",
+                    "bytes=" + "0" * 4400 + "5-"):
+            r, _ = self.req("GET", path, user="t107b", raw=True,
+                            headers={"Range": hdr})
+            self.assertIn(r.status, (200, 206, 416), hdr[:16])
+        status, _ = self.req("GET", f"{path[:-1]}" + "0" * 4301, user="t107b")
+        self.assertEqual(status, 400)
+
+    def test_108_a_second_update_event_is_not_coalesced_away(self):
+        # Update entries are named (mid, kind, actor), so a second change by
+        # one actor lands on the SAME symlink and queue_add swallows the
+        # collision. Confirming the first one after that retired the only
+        # carrier the delete had, and the recipient was never told again.
+        self.fresh("t108a", "t108b")
+        sent = self.send_msg("t108a", "teh typo", to="t108b")
+        mid, gid = sent["id"], sent["gid"]
+        self.poll_until("t108b", lambda e: e["id"] == mid)
+        self.confirm("t108b", [mid])
+        status, _ = self.req("POST", "/api/message/edit", user="t108a",
+                             body={"gid": gid, "mid": mid, "text": "typo (fixed)"})
+        self.assertEqual(status, 200)
+        ev = self.poll_until("t108b", lambda e: e["kind"] == "updated")
+        _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t108b")
+        self.assertEqual(st["text"], "typo (fixed)")
+        # …and the delete lands in the window between that refetch and the
+        # confirm — one HTTP round trip on loopback, seconds on a phone
+        status, _ = self.req("POST", "/api/message/delete", user="t108a",
+                             body={"gid": gid, "mid": mid})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.confirm("t108b", [ev["entry"]])["confirmed"], 0)
+        again = self.poll_until("t108b", lambda e: e["kind"] == "updated")
+        self.assertEqual(again["entry"], ev["entry"])
+        _, st = self.req("GET", f"/api/message/state/{gid}/{mid}", user="t108b")
+        self.assertTrue(st["deleted"])
+        # nothing changed since, so this confirm sticks and the queue drains —
+        # a redelivered entry must not become a hot loop
+        self.assertEqual(self.confirm("t108b", [again["entry"]])["confirmed"], 1)
+        self.assertEqual([e for e in self.poll("t108b", wait=0)
+                          if e["id"] == mid], [])
+
+    def test_109_set_password_preserves_every_line_terminator(self):
+        # The parser uses splitlines(), which honours EIGHT terminators beyond
+        # \n; the rewriter split on \n alone, so one password change on a
+        # CR-separated file collapsed every other entry — including a disabled
+        # one, destroying the record that was blocking that account.
+        from internalchat.roster import Roster, make_hash, check_hash
+        spec = make_hash("pw-x", 1000)
+        tmp = tempfile.mkdtemp(prefix="chat-roster-term-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pw = chatserver.Path(tmp) / "passwd"
+        for term in ("\n", "\r\n", "\r", "\x85"):
+            head = b"# ops: do not edit by hand"
+            body = (head + term.encode()
+                    + f"alice:Alice::{spec}".encode() + term.encode()
+                    + f"carol:Carol:disabled:{spec}".encode() + term.encode())
+            pw.write_bytes(body)
+            r = Roster(pw)
+            self.assertEqual(sorted(r.entries()), ["alice", "carol"], repr(term))
+            r.set_password("alice", make_hash("pw-alice-2", 1000))
+            r.invalidate()
+            self.assertEqual(sorted(r.entries()), ["alice", "carol"], repr(term))
+            self.assertTrue(r.entry("carol").disabled, repr(term))
+            self.assertTrue(check_hash("pw-alice-2", r.entry("alice").password))
+            raw = pw.read_bytes()
+            self.assertTrue(raw.startswith(head + term.encode()), repr(term))
+            self.assertTrue(raw.endswith(term.encode()), repr(term))
+
+    def test_110_concurrent_thumbs_claim_the_slot_exactly_once(self):
+        # "One thumb per staged file (409 on a second)" was guarded by an
+        # exists() check, so racers all passed it, all charged the quota, and
+        # collided on a shared tmp path — one of them 500'd.
+        self.fresh("t110")
+        fid = self.upload("t110", b"B" * 2048, "photo.bin")["file_id"]
+        gif = b"GIF89a" + b"\x00" * 1500
+        before = self.store.storage_used("t110")
+        results = []
+
+        def post():
+            st, _ = self.req("POST", f"/api/files/{fid}/thumb", user="t110",
+                             body=gif)
+            results.append(st)
+
+        threads = [threading.Thread(target=post) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results), [200] + [409] * 5, results)
+        # charged once, for the bytes that are actually on disk
+        self.assertEqual(self.store.storage_used("t110") - before, len(gif))
+
+    def test_111_an_orphaned_staged_meta_is_reclaimed(self):
+        # _prune_staged skips every *.meta and removes one only alongside its
+        # blob, so a meta whose blob is gone (upload_thumb rewriting it after
+        # a racing send consumed the file) was immortal.
+        import time as _time
+        tmp = tempfile.mkdtemp(prefix="chat-staged-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        store = chatserver.Store(tmp, iters=1000)
+        store.add_user("s1", "pw-s1-123", must_change=False)
+        store.provision("s1")
+        staged = store.user_dir("s1") / "staged"
+        orphan = staged / ("c" * 32 + ".meta")
+        orphan.write_text(json.dumps({"name": "x", "size": 10}))
+        blob, meta = staged / ("d" * 32), staged / ("d" * 32 + ".meta")
+        blob.write_bytes(b"12345")
+        meta.write_text(json.dumps({"name": "y", "size": 5}))
+        old = _time.time() - 40 * 3600
+        os.utime(orphan, (old, old))
+        chatserver.Janitor(store, interval=3600).clean()
+        self.assertFalse(orphan.exists(), "an orphaned meta is never reclaimed")
+        self.assertTrue(blob.exists() and meta.exists(), "a live pair survived")
+
+    def test_112_adduser_can_create_the_user_file_it_is_pointed_at(self):
+        # The hardened layout install.sh documents (--roster /etc/…/passwd)
+        # has to be bootstrappable; the guard against a MISTYPED --roster
+        # still applies to every other subcommand.
+        from internalchat.roster import Roster
+        tmp = tempfile.mkdtemp(prefix="chat-bootstrap-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        data = chatserver.Path(tmp) / "data"
+        roster = chatserver.Path(tmp) / "etc" / "passwd"
+        roster.parent.mkdir(parents=True)
+        chatserver.main(["adduser", "alice", "--data", str(data),
+                         "--roster", str(roster), "--password", "pw-alice-1",
+                         "--no-change"])
+        self.assertTrue(roster.is_file())
+        self.assertEqual(stat.S_IMODE(roster.stat().st_mode), 0o600)
+        self.assertIn("alice", Roster(roster).entries())
+        with self.assertRaises(SystemExit):
+            chatserver.main(["roster", "--data", str(data),
+                             "--roster", str(roster) + "-typo"])
+
+    def test_113_password_change_is_rate_limited(self):
+        # The one endpoint that ran an UNLIMITED password verify: a token
+        # without its password could brute-force `old` at full speed, and the
+        # plaintext outlives session revocation.
+        self.fresh("t113")
+        seen = set()
+        for _ in range(13):
+            st, _ = self.req("POST", "/api/password", user="t113",
+                             body={"old": "wrong-guess", "new": "irrelevant1"})
+            seen.add(st)
+        self.assertEqual(seen, {403, 429})
+
+    def test_114_client_version_is_deliberately_unauthenticated(self):
+        # The one documented exception to the Bearer rule (API.md §7), pinned
+        # so it stays a decision rather than an oversight: the same bytes are
+        # already public through the static route.
+        tmp = tempfile.mkdtemp(prefix="chat-static-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        static = chatserver.Path(tmp) / "static"
+        static.mkdir()
+        (static / "version.json").write_text('{"version_code": 7}')
+        store = chatserver.Store(tmp, iters=1000)
+        httpd, router, _api = chatserver.build_server(store, "127.0.0.1", 0,
+                                                      static)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(router.join, 5)
+        self.addCleanup(router.wake.set)
+        self.addCleanup(router.stopping.set)
+        port = httpd.server_address[1]
+        st, body = self.rreq(port, "GET", "/api/client/version")
+        self.assertEqual((st, body["version_code"]), (200, 7))
+        st, body = self.rreq(port, "GET", "/version.json")   # already public
+        self.assertEqual((st, body["version_code"]), (200, 7))
+        st, _ = self.rreq(port, "GET", "/api/users")         # everything else
+        self.assertEqual(st, 401)
+
+    def test_115_burn_cost_follows_the_file_not_the_config(self):
+        # Hash specs are self-describing so PBKDF2_ITERS can be raised — which
+        # means the config and the file's stored counts disagree until every
+        # user has changed their password. burn() has to cost what a REAL
+        # verify of THIS file costs, or an unknown username is measurably
+        # slower than a known one and login becomes an existence oracle.
+        import time as _time
+        from internalchat.roster import make_hash
+        tmp = tempfile.mkdtemp(prefix="chat-roster-cost-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pw = chatserver.Path(tmp) / "passwd"
+        pw.write_text(f"known:K::{make_hash('pw-known', 20_000)}\nnopass:N::\n")
+        store = chatserver.Store(tmp, iters=100_000)   # the operator raised it
+        self.assertEqual(store.roster.hash_cost(store.iters), 20_000)
+
+        def cost(user, password):
+            xs = []
+            for _ in range(5):
+                t0 = _time.perf_counter()
+                store.verify_password(user, password)
+                xs.append(_time.perf_counter() - t0)
+            return sorted(xs)[2]
+
+        shapes = {"unknown name": cost("nobody", "x"),
+                  "wrong password": cost("known", "wrong"),
+                  "no password set": cost("nopass", "x")}
+        spread = max(shapes.values()) / max(min(shapes.values()), 1e-9)
+        self.assertLess(spread, 2.0, f"login timing is not flat: {shapes}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

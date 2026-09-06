@@ -32,6 +32,14 @@ class Router(threading.Thread):
         self.notifier = notifier
         self.wake = threading.Event()
         self.stopping = threading.Event()
+        # Messages that are STORED but whose fan-out did not finish (one
+        # recipient's queue_add hit ENOSPC/EDQUOT/EIO). Retried on every drain
+        # tick — see _retry_unfinished. Capped because it is memory: past the
+        # cap the message still lands on disk and _recover picks it up at the
+        # next start, which is the pre-existing behaviour.
+        self._unfinished: set[Path] = set()
+
+    MAX_UNFINISHED = 256
 
     def run(self) -> None:
         self._recover()
@@ -41,13 +49,48 @@ class Router(threading.Thread):
             self.drain()
 
     def drain(self) -> None:
+        self._retry_unfinished()
         inc = self.store.root / "incoming"
         for src in sorted(inc.iterdir()):
             try:
                 self._route(src)
             except Exception as e:
-                log(f"router: rejecting {src.name}: {e}")
-                self._bounce(src)
+                # Only a failure BEFORE the rename leaves anything in
+                # incoming/, and only that one is genuinely a rejection. Once
+                # the message has been renamed into its group it is STORED —
+                # history and /api/groups serve it — so _bounce could not act
+                # (src is gone, so os.replace raises and the rmtree is a
+                # no-op) and calling it "rejecting" told the operator the
+                # opposite of what happened.
+                if src.exists():
+                    log(f"router: rejecting {src.name}: {e}")
+                    self._bounce(src)
+                else:
+                    log(f"router: {src.name} is stored but its fan-out did "
+                        f"not finish: {e}")
+
+    def _retry_unfinished(self) -> None:
+        """Re-run the fan-out for messages that were stored but not fully
+        queued. Every step of _finish is idempotent, so a retry costs one
+        symlink attempt per recipient and heals the instant the disk does.
+        Without it the missed push waits for a RESTART, and even then only if
+        the message is still in one of its group's two newest day folders —
+        _recover's window (see its docstring) assumes an outage stops traffic,
+        which is exactly what a partial ENOSPC does not do."""
+        for dest in sorted(self._unfinished):
+            # Broad, like drain's own guard: this runs on the router thread's
+            # only loop, which has no handler above it — an exception here
+            # would kill message routing outright.
+            try:
+                gid = self.store.gid_of(dest)
+                sender = (dest / "from").read_text().strip()
+                self._finish(dest, dest.name, sender, self.store.members(gid))
+            except Exception as e:
+                if not dest.is_dir():
+                    # archived by retention, or its group was removed: there
+                    # is nothing left to deliver
+                    self._unfinished.discard(dest)
+                    log(f"router: giving up on {dest.name}: {e}")
 
     def _bounce(self, src: Path) -> None:
         """A rejected message must not leave the sender's ✓ lying: park the
@@ -88,11 +131,33 @@ class Router(threading.Thread):
     def _finish(self, dest: Path, mid: str, sender: str, members: list[str]) -> None:
         (dest / "deliveredto").mkdir(exist_ok=True)
         (dest / "readby").mkdir(exist_ok=True)
+        retrying = dest in self._unfinished
+        complete = True
         for uid in members:
-            if uid != sender:
+            if uid == sender:
+                continue
+            # ISOLATE each recipient. queue_add only swallows FileExistsError
+            # and FileNotFoundError, so a full disk (ENOSPC), a per-user quota
+            # (EDQUOT) or an I/O error on ONE queue used to abort the loop:
+            # every member after them in the sorted list lost the message's
+            # push too, and .routed was never written. One bad queue must cost
+            # one recipient, not the rest of the group.
+            try:
                 self.store.queue_add(uid, mid, dest)
                 self.notifier.notify(uid)
-        (dest / ".routed").touch()
+            except OSError as e:
+                complete = False
+                if not retrying:     # stay quiet on every 2s retry pass
+                    log(f"router: {mid}: queueing to {uid} failed: {e}")
+        if complete:
+            # .routed is the "fan-out finished" marker _recover keys on, so it
+            # must not be written while a recipient is still missing an entry
+            (dest / ".routed").touch()
+            if dest in self._unfinished:
+                self._unfinished.discard(dest)
+                log(f"router: {mid}: fan-out completed on retry")
+        elif not retrying and len(self._unfinished) < self.MAX_UNFINISHED:
+            self._unfinished.add(dest)
 
     def _recover(self) -> None:
         """Finish messages that were renamed into a group but crashed before
@@ -242,6 +307,18 @@ class Janitor(threading.Thread):
         user = udir.name
         for p in entries:
             if p.name.endswith(".meta"):
+                # A meta is normally removed alongside its blob below. One
+                # whose blob is already gone never was: upload_thumb rewrites
+                # <fid>.meta after a racing send has consumed the staged file
+                # (API.md calls that race benign — it is, except for this
+                # orphan), and nothing else would ever reclaim it. Same 24h
+                # clock as everything else in staged/.
+                try:
+                    if (now - p.lstat().st_mtime > 86400
+                            and not (staged / p.name[:-len(".meta")]).exists()):
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 continue
             try:
                 if now - p.lstat().st_mtime <= 86400:
