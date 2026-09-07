@@ -309,7 +309,17 @@ class Api:
         with self._handed_lock:
             if (len(self._handed) >= self.MAX_HANDED
                     and (user, entry) not in self._handed):
-                return
+                # Full. Entries are forgotten on confirm, but a symlink the
+                # janitor swept or retention archived — handed out, never
+                # confirmed — stayed here for the life of the process, so the
+                # table filled with ghosts and the guard silently switched
+                # itself off. Shed the ghosts (a stat each, only when full,
+                # so it costs nothing on the normal path) before giving up.
+                for key in [k for k in self._handed
+                            if not (self.store.queue_dir(k[0]) / k[1]).is_symlink()]:
+                    del self._handed[key]
+                if len(self._handed) >= self.MAX_HANDED:
+                    return
             self._handed[(user, entry)] = mtime
 
     def _superseded(self, user: str, entry: str, link: Path) -> bool:
@@ -537,7 +547,17 @@ class Api:
             # `at` then reports the latest change, and confirm can tell that a
             # client holding the older state must not retire the entry.
             try:
-                os.utime(self.store.queue_dir(u) / entry, follow_symlinks=False)
+                link = self.store.queue_dir(u) / entry
+                # STRICTLY newer than whatever stamp a poll may already have
+                # handed out, not merely "now": file timestamps come off the
+                # kernel's coarse clock, so a re-stamp inside the same tick as
+                # the hand-out's lstat would compare EQUAL and confirm would
+                # retire the entry anyway — the exact loss this exists to
+                # stop, now a few microseconds wide instead of a round trip.
+                # max() also survives a backward wall-clock step, which would
+                # otherwise stamp the newer change OLDER than the handed one.
+                ns = max(time.time_ns(), link.lstat().st_mtime_ns + 1)
+                os.utime(link, ns=(ns, ns), follow_symlinks=False)
             except OSError:
                 pass            # the user was revoked, or their queue is gone
             self.notifier.notify(u)
