@@ -31,6 +31,12 @@ class Store:
         self.roster = Roster(Path(roster) if roster else self.root / "passwd")
         self._id_lock = threading.Lock()
         self._quota_lock = threading.Lock()
+        # Held by the router across the ONE rename that moves a message out of
+        # incoming/, and by recount_all_storage across its walk of incoming/.
+        # Without it the walk and the rename race: the walk lists a message in
+        # incoming/, the router moves it, the walk's read fails and counts 0 —
+        # or the walk counts it AND the later groups/ walk counts it again.
+        self._route_lock = threading.Lock()
         for name in ("tmp", "incoming", "users", "groups", "archive", "rejected"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         # High-water mark for the message-id clock, persisted so a restart
@@ -178,18 +184,36 @@ class Store:
             except OSError:
                 return
 
+        # incoming/ FIRST, under the route lock: send() returns the moment a
+        # message is spooled and the router is woken, so its bytes live here
+        # until the router thread gets scheduled — under load, long enough for
+        # a recount to run in between and refund the sender for a message that
+        # is durable and about to be delivered. The lock pins every message
+        # listed here in place while it is counted; the mids are remembered so
+        # the groups/ walk below, which runs after the lock is released and
+        # may find the same message freshly routed, cannot count it twice.
+        counted: set[str] = set()
+        with self._route_lock:
+            try:
+                for mdir in (self.root / "incoming").iterdir():
+                    if mdir.is_dir():
+                        count_msg(mdir)
+                        counted.add(mdir.name)
+            except FileNotFoundError:
+                pass
         for gdir in groups:
             for mdir in msg_dirs_newest_first(gdir):
-                count_msg(mdir)
-        # Bounced messages are STILL BYTES ON DISK. Leaving rejected/ out of
-        # this walk meant the hourly recount refunded the sender's quota while
-        # the blobs stayed forever: a user could race a send against leaving
-        # the group, park up to 8x50MB per win, and get the whole allowance
-        # back an hour later. rejected/<mid> is a message dir, not a group
-        # dir, so it is walked directly rather than through msg_dirs.
+                if mdir.name not in counted:
+                    count_msg(mdir)
+        # rejected/: bounced messages, which nothing reclaimed. Leaving them
+        # out meant the hourly recount refunded the sender while the blobs
+        # stayed forever — race a send against leaving the group, park up to
+        # 8x50MB per win, get the allowance back an hour later. Message dirs,
+        # not group dirs, so walked directly; a bounce is a rename too, hence
+        # the same mid guard.
         try:
             for mdir in (self.root / "rejected").iterdir():
-                if mdir.is_dir():
+                if mdir.is_dir() and mdir.name not in counted:
                     count_msg(mdir)
         except FileNotFoundError:
             pass

@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1072,7 +1073,12 @@ class ChatServerTest(unittest.TestCase):
         self.send_msg("t51a", "zebra pre-join", gid=g["gid"])
         self.req("POST", f"/api/groups/{g['gid']}/members", user="t51a",
                  body={"add": ["t51c"]})
-        self.send_msg("t51a", "zebra post-join", gid=g["gid"])
+        last = self.send_msg("t51a", "zebra post-join", gid=g["gid"])["id"]
+        # send() returns once the message is SPOOLED; search walks groups/,
+        # which it reaches only when the router thread runs. Wait for the
+        # newest one to land — incoming/ drains in id order, so the two sent
+        # before it have landed too — or a loaded box searches too early.
+        self.poll_until("t51b", lambda e: e["id"] == last)
         # alice sees both group hits and the dm hit
         _, res = self.req("GET", "/api/search?q=zebra", user="t51a")
         texts = [r["snippet"] for r in res["results"]]
@@ -1091,7 +1097,8 @@ class ChatServerTest(unittest.TestCase):
         self.assertEqual(status, 403)
         # attachment-name matches hit too
         up = self.upload("t51a", b"\x00binary", name="zebra-report.pdf")
-        self.send_msg("t51a", "", to="t51b", files=[up["file_id"]])
+        att = self.send_msg("t51a", "", to="t51b", files=[up["file_id"]])["id"]
+        self.poll_until("t51b", lambda e: e["id"] == att)   # same reason
         _, res = self.req("GET", "/api/search?q=zebra-report", user="t51b")
         self.assertEqual(len(res["results"]), 1)
         self.assertIn("zebra-report.pdf", res["results"][0]["snippet"])
@@ -2667,7 +2674,16 @@ class ChatServerTest(unittest.TestCase):
             os.symlink = real
         self.router.wake.set()          # the disk recovers: the retry heals it
         self.poll_until("t106b", lambda e: e["id"] == mid)
-        self.assertTrue((self.store.msg_dir(gid, mid) / ".routed").exists())
+        # the queue entry is visible the instant its symlink lands, but the
+        # router touches .routed only AFTER the loop over every member — so
+        # under load this thread can observe the entry a few ms before the
+        # marker exists. Give the router thread a moment, never a fixed sleep.
+        routed = self.store.msg_dir(gid, mid) / ".routed"
+        for _ in range(200):
+            if routed.exists():
+                break
+            time.sleep(0.01)
+        self.assertTrue(routed.exists())
 
     def test_107_absurdly_long_digit_strings_are_not_500s(self):
         # Python 3.11 refuses int() on more than 4300 digits. Both the Range

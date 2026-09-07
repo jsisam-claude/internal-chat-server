@@ -97,7 +97,10 @@ class Router(threading.Thread):
         message dir in rejected/ and queue a ~x~ failure event to the sender."""
         dst = self.store.root / "rejected" / src.name
         try:
-            os.replace(src, dst)
+            # a bounce is a rename out of incoming/ too — same lock, same
+            # reason as _route: recount must never see the in-between
+            with self.store._route_lock:
+                os.replace(src, dst)
         except OSError:
             shutil.rmtree(src, ignore_errors=True)
             return
@@ -122,10 +125,14 @@ class Router(threading.Thread):
             raise ValueError("sender not a member")
         dest = self.store.msg_dir(gid, mid)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            shutil.rmtree(src)  # duplicate of an already-routed message
-        else:
-            os.replace(src, dest)
+        # the rename is the one instant a message is in neither incoming/ nor
+        # its group; recount_all_storage takes the same lock around its walk
+        # of incoming/ so it can never observe that instant (see Store)
+        with self.store._route_lock:
+            if dest.exists():
+                shutil.rmtree(src)  # duplicate of an already-routed message
+            else:
+                os.replace(src, dest)
         self._finish(dest, mid, sender, members)
 
     def _finish(self, dest: Path, mid: str, sender: str, members: list[str]) -> None:
