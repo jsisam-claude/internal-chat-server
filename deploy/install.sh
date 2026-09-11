@@ -72,7 +72,10 @@ chmod 0700 "$DATA"
 # DIRECTORY — a read-only file in a writable directory is just replaced by
 # the atomic rewrite) — logins keep working and self-service password
 # changes answer 503. `chatserver.py adduser --roster <path>` creates that
-# file on the first user, so it needs no touch beforehand.
+# file on the first user, so it needs no touch beforehand — but as root it
+# creates it 0600 root-owned, which the SERVICE cannot read, and a user file
+# that cannot be read denies every login. Finish that move with
+# `chown root:$SVCUSER <path> && chmod 0640 <path>`.
 if [ -f "$DATA/passwd" ]; then
     chown "$SVCUSER:$SVCUSER" "$DATA/passwd"
     chmod 0600 "$DATA/passwd"
@@ -94,8 +97,11 @@ fi
 
 echo
 echo "next steps:"
-# provision AS THE SERVICE USER so the created users/<name>/{sessions,queue,...}
-# dirs are owned by the service — running adduser as root makes them root-owned
-# and the service (running as $SVCUSER) then 500s on login trying to write them.
+# provision AS THE SERVICE USER. adduser creates no directories at all any
+# more — it appends one line to $DATA/passwd (and creates that file, 0600, for
+# the first user); the account's folders appear on first contact. Run as root
+# it leaves $DATA/passwd root-owned 0600, which the service cannot READ, and
+# an unreadable user file denies EVERY login: a fresh install where nobody can
+# log in is almost always this.
 echo "  sudo -u $SVCUSER python3 $APP/chatserver.py adduser <name> --data $DATA"
 echo "  mount $DATA with noexec,nosuid,nodev                     # recommended"

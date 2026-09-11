@@ -1,19 +1,28 @@
 # internal-chat — Client/Server API
 
-Everything is JSON over HTTPS except file bytes. All endpoints except
-`POST /api/login` and `GET /api/client/version` (§7) require
+Everything is JSON over HTTPS except file bytes. Every `/api/` endpoint
+except `POST /api/login` and `GET /api/client/version` (§7) requires
 `Authorization: Bearer <token>`. Errors are `{"error": "<message>"}`. Status
 codes: 400 (bad input, incl. duplicate file id), 401 (no/expired session),
 403 (not a member / wrong password / not your message), 404 (not found /
 pre-join), 409 (already claimed — a second thumb for one staged file), 413
 (file too big or per-user storage quota exceeded, 2 GB), 429 (rate-limited:
 login, password change, send/react/edit/delete, upload, group ops, search,
-starred, typing), 503 (server at its connection cap, a transient send-claim
-collision, or the user file cannot be written — retry), 507 (a write would
-push the user file past its size cap, see §1), 500 (server bug). `confirm`
-and `viewed` process at most 500 ids per call, so clients must chunk larger
-batches (the server silently ignores the overflow otherwise); one poll
-returns at most 500 queue entries, so a backlog drains over several polls.
+starred, typing), 503 (transient, so retry: a send-claim collision, a failed
+provisioning or delete, or the user file cannot be written), 507 (a write
+would push the user file past its size cap, see §1), 500 (server bug).
+`confirm` and `viewed` process at most 500 ids per call, so clients must
+chunk larger batches (the server silently ignores the overflow otherwise);
+one poll returns at most 500 queue entries, so a backlog drains over several
+polls.
+
+Overload is **not** a status code. At `MAX_CONNECTIONS` (512, `config.py`)
+concurrent connections the surplus one is closed at the accept side, before
+any request is read — so a saturated server looks like a dropped connection,
+never a `503`. A TLS handshake that has not completed within
+`HANDSHAKE_TIMEOUT` (15 s) is dropped the same way. Both are retryable:
+treat a connection that closes with no response as backpressure, not as a
+protocol error.
 
 The one rule that shapes everything: **a client learns things only through
 its queue** (`GET /api/messages`). New messages, delivered ticks, read ticks,
@@ -27,13 +36,14 @@ all arrive there; every other GET is for (re)building state from the truth
 |---|---|
 | `POST /api/login` | `{"user","password"}` → `{"token","user","display","must_change"}` |
 | `POST /api/logout` | → `{"ok":true}` (invalidates this token) |
-| `POST /api/password` | `{"old","new"}` → `{"ok":true}` — kills every *other* session |
+| `POST /api/password` | `{"old","new"}` → `{"ok":true}` — `new` is 8..128 characters (`400` otherwise); kills every *other* session |
 
 Login is rate-limited per IP+user (10 / 5 min → 429) **and** per source IP
-(60 / 5 min). `POST /api/password` shares the per-user budget (10 / 5 min):
-checking `old` is a full password verify, so it is guessable at speed by
-anyone holding a token but not the password. If `must_change` is true, the
-client must show the password-change screen before anything else.
+(60 / 5 min). `POST /api/password` gets a budget of its own, the same size
+(10 / 5 min) but keyed on the account alone: checking `old` is a full
+password verify, so it is guessable at speed by anyone holding a token but
+not the password. If `must_change` is true, the client must show the
+password-change screen before anything else.
 
 > The "source IP" is the **TCP peer**. Terminate TLS at a reverse proxy, or
 > reach the server across a NAT gateway, and every client collapses onto one
@@ -69,8 +79,9 @@ one with `chatserver.py hashpw`, or add whole lines with
 **There is no other provisioning step.** An account's directory tree
 (queue, sessions, staged uploads) is created automatically on *first
 contact*: the first successful login, or the first message routed to the
-user. Everyone listed appears in `GET /api/users` immediately — DM-able
-from day zero, their queue materialising with the first message.
+user. Everyone listed and not `disabled` appears in `GET /api/users`
+immediately — DM-able from day zero, their queue materialising with the
+first message.
 
 * The file is **authoritative and hot-reloaded**: add a line and the user
   can log in on the next request; remove it and they are cut off within
@@ -94,8 +105,13 @@ from day zero, their queue materialising with the first message.
   hardening stance — logins keep working and self-service changes answer
   `503`. What enforces that stance is an unwritable **directory** (both the
   lock and the atomic replace create files in it); a read-only `passwd`
-  inside a writable directory is simply replaced. Since the file holds
-  hashes, keep it `0600` (the CLI creates it that way).
+  inside a writable directory is simply replaced. Whatever you lock down, it
+  must stay **readable by the service**: since it holds hashes, that means
+  `0600` owned by the service user (what `adduser` creates when run as that
+  user), or `root:<service-group>` `0640` for a root-owned file. Root-owned
+  `0600` is the one combination that looks hardened and denies *everyone*:
+  the service cannot read its own user database, and an unreadable user file
+  denies.
 * Edit it **atomically** (write a temp file and `rename`). A
   truncate-in-place rewrite can be read half-written, and the outcome is not
   always the safe one: a read landing mid-line usually denies, but a line cut
@@ -124,7 +140,11 @@ preserved, so nobody's password changes.
 ### `GET /api/messages?wait=25`
 
 Long-polls up to `wait` seconds (max 30) if the queue is empty; returns
-immediately otherwise. The response may also carry `"typing"` —
+immediately otherwise. One user may hold at most `MAX_POLLS_PER_USER` (8)
+*parked* polls at once — that is a per-account bound on worker threads, not
+an error: a ninth concurrent poll skips the park and answers within about
+half a second with whatever is queued. One poll per device is the shape this
+expects. The response may also carry `"typing"` —
 `{"<gid>": ["bob", …]}`, everyone currently typing in a group you are in,
 excluding yourself. It is ephemeral in-memory state, not a queue entry:
 nothing to confirm, and an ABSENT or empty `typing` clears every indicator. A
@@ -359,19 +379,33 @@ Both are **announced in-band**: a system message (`"system":{"event":
 other clients learn the group exists or changed. Members can add anyone and
 remove only themselves. Leaving ends access and sweeps the leaver's queue.
 
+`name` is 1..64 printable characters and a group holds 2..64 members
+(`MAX_GROUP_MEMBERS`), checked at create and again on every add (`400`).
+A DM has no membership API at all: `POST /api/groups/<gid>/members` answers
+`400` for a `d-…` gid, because a DM's pair is fixed by its id — add a third
+person by creating a group.
+
 ## 7. Distribution
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /` (+ static files) | the web client, served same-origin |
-| `GET /api/client/version` | `{version_code, sha256, url}` for APK self-update |
-| `GET /download/app.apk` | the sideload APK (via the static dir) |
+| `GET /api/client/version` | `{"version_code":…, "sha256":…}` for APK self-update; `404 no client published` when the static dir holds no `version.json` |
+| `GET /download/app.apk` | the sideload APK (a plain static file) |
 
 `GET /api/client/version` is the **one endpoint that needs no Bearer token**,
 deliberately: it echoes `version.json` out of the static directory, which the
 static route already serves unauthenticated at `/version.json`, describing an
 APK that `/download/app.apk` hands to anyone. Requiring a session would hide
 nothing and would break an updater that must check before it has one.
+
+The server does not parse that file — it streams whatever is there — so the
+contract is the client's: the sideload updater reads `version_code` and
+`sha256` and fetches the APK from the **fixed** same-origin path above, never
+from a URL named in the JSON, so a tampered version file cannot redirect the
+download off-origin. Neither file is shipped by `deploy/install.sh` (it
+installs the web client only); publishing a build means dropping
+`version.json` and `download/app.apk` into the static dir yourself.
 
 ## 8. The client loop, end to end
 

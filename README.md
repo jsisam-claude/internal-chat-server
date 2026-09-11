@@ -86,7 +86,11 @@ file"). What an operator needs on one screen:
   (`--roster /etc/internal-chat/passwd` with a root-owned *directory*) —
   logins keep working and self-service password changes answer 503. A
   read-only *file* in a writable directory hardens nothing: the atomic
-  replace still succeeds.
+  replace still succeeds. Either way it must stay **readable by the
+  service**: root-owned `0600` — what `adduser` leaves behind when run as
+  root — is an unreadable file, and an unreadable file denies everyone. So
+  run `adduser` as the service user, or `chown root:internal-chat` and
+  `chmod 0640`.
 - `chatserver.py roster` prints the file against the on-disk accounts. It is
   the first thing to run when nobody can log in.
 
@@ -99,7 +103,8 @@ python3 -m unittest discover -s tests
 The suite starts the real server on a loopback port and drives the full flow:
 login → send → queue → dequeue (peek/confirm) → delivered + read flags →
 groups → attachment upload/download, plus authorization, validation,
-rate-limit, and upload-inertness checks.
+rate-limit, upload-inertness, and user-file checks (hot reload, revocation
+reaching live sessions, every unreadable file shape denying).
 
 `tests/load_test.py` is a separate concurrency load test (not picked up by
 `discover`) — run it explicitly to verify the connection cap, parked-poll
@@ -113,13 +118,14 @@ python3 tests/load_test.py
 
 ```
 data/
+├── passwd                          # THE user database — one line per user
 ├── incoming/                       # accepted, awaiting routing (the queue)
 ├── users/<u>/queue/                # symlinks: new messages + flag events
 │                                   #   (~d~ delivered, ~r~ read, ~x~ bounced,
-│                                   #    ~a~ reaction, ~u~ edited/deleted)
+│                                   #    ~u~ reacted/edited/deleted)
 ├── users/<u>/{staged,nonces,sessions,starred}   # auto-provisioned on first contact
 ├── users/<u>/{storage_used,lastseen}  # quota cache; coarse last-activity stamp
-├── groups/<gid>/members/<u>        # roster = marker files
+├── groups/<gid>/members/<u>        # group membership; holds the join stamp
 ├── groups/<gid>/<date>/<msg-id>/   # message.txt, from, attachments/,
 │                                   # deliveredto/<u>, readby/<u>,
 │                                   # reactions/<u> (=emoji), reply_to,
@@ -144,10 +150,25 @@ readby:      bob        # ✓✓ read (mtime = when)
 
 ## Deployment notes (see DESIGN.md §5/§9 for the full model)
 
-- Run as a dedicated non-root user; mount the data dir `noexec,nosuid,nodev`.
-- Suggested systemd hardening: `ProtectSystem=strict`, `NoNewPrivileges=yes`,
-  `ReadWritePaths=<data dir>`, `PrivateTmp=yes`.
-- Back up by snapshotting/rsyncing `data/` — it's only files.
+- `sh deploy/install.sh [/path/to/internal-chat-web]` does the whole install
+  on a systemd host — service user, `/opt/internal-chat` (code),
+  `/etc/internal-chat/server.pem` (self-signed if absent),
+  `/var/lib/internal-chat` (data, `0700`), the web client, and
+  `deploy/internal-chat.service`. Re-running it upgrades the code in place
+  and restarts the unit, so it is the upgrade path too. Then add users **as
+  the service user** — the script's closing lines print the exact command.
+- Run as a dedicated non-root user; mount the data dir `noexec,nosuid,nodev`
+  (the installer recommends this but cannot do it for you).
+- The shipped unit already sets `ProtectSystem=strict`, `NoNewPrivileges=yes`,
+  `ReadWritePaths=<data dir>`, `PrivateTmp=yes` and a stripped capability set
+  — keep them if you write your own.
+- Concurrency is bounded, and the bound is invisible to clients: past
+  `MAX_CONNECTIONS` (512) the surplus connection is closed at the accept side
+  with no response, and a TLS handshake gets `HANDSHAKE_TIMEOUT` (15 s) to
+  finish. In a client log an overloaded server looks like a dropped
+  connection, not a 503.
+- Back up by snapshotting/rsyncing `data/` — `passwd` included; it's only
+  files.
 - The login rate limits key on the **TCP peer**. If you terminate TLS at a
   reverse proxy or reach the server across a NAT gateway, every user shares
   one key and `LOGIN_IP_LIMIT` (60 / 5 min, `config.py`) becomes a
