@@ -9,7 +9,7 @@ Module map
 config     limits, regexes, CSP, static-type table
 errors     ApiError (the one raised type)
 util       stateless helpers (ids, filenames, directory walks, logging)
-roster     Roster — passwd-style allowlist of who may connect
+roster     Roster — the passwd-style file that IS the user database
 store      Store — the on-disk data model
 notifier   per-user wakeups for long-polling
 ratelimit  bounded sliding-window rate limiter
