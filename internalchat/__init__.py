@@ -9,13 +9,14 @@ Module map
 config     limits, regexes, CSP, static-type table
 errors     ApiError (the one raised type)
 util       stateless helpers (ids, filenames, directory walks, logging)
+roster     Roster — the passwd-style file that IS the user database
 store      Store — the on-disk data model
 notifier   per-user wakeups for long-polling
 ratelimit  bounded sliding-window rate limiter
 router     Router (moves/fans out messages) + Janitor (retention)
 api        Api — all request-handling business logic, HTTP-independent
 server     the HTTP handler + build_server() wiring
-cli        `serve` / `adduser` / `passwd` command line
+cli        `serve` / `adduser` / `roster` / `passwd` command line
 """
 from .config import (  # noqa: F401  (re-exported for tests / embedders)
     SEND_LIMIT, SEND_WINDOW, UPLOAD_LIMIT, UPLOAD_WINDOW, LOGIN_IP_LIMIT,
@@ -24,6 +25,7 @@ from .config import (  # noqa: F401  (re-exported for tests / embedders)
 from .errors import ApiError  # noqa: F401
 from .util import (  # noqa: F401
     log, now_ms, mid_date, sanitize_filename, msg_dirs_newest_first, image_mime)
+from .roster import Roster  # noqa: F401
 from .store import Store  # noqa: F401
 from .notifier import Notifier  # noqa: F401
 from .ratelimit import RateLimiter  # noqa: F401
@@ -33,7 +35,7 @@ from .server import Handler, build_server  # noqa: F401
 from .cli import main  # noqa: F401
 
 __all__ = [
-    "Store", "Notifier", "RateLimiter", "Router", "Janitor", "Api",
+    "Roster", "Store", "Notifier", "RateLimiter", "Router", "Janitor", "Api",
     "Handler", "build_server", "main", "ApiError",
     "log", "now_ms", "mid_date", "sanitize_filename", "msg_dirs_newest_first",
     "image_mime",

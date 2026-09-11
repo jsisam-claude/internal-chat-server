@@ -61,6 +61,11 @@ LASTSEEN_PERSIST_SECS = 300    # write users/<u>/lastseen at most this often
 USER_STORAGE_QUOTA = 2 * 1024 * 1024 * 1024   # 2 GB of attachments per user
 MAX_CONNECTIONS = 512    # global cap on concurrent request threads (bounds the
                          # thread/FD cost of a long-poll flood)
+
+HANDSHAKE_TIMEOUT = 15   # seconds a TLS handshake may take before the
+                         # connection is dropped. It runs in the worker
+                         # thread (never the accept loop), so a stalled
+                         # one costs a bounded slot, not the server.
 MAX_POLLS_PER_USER = 8   # concurrent parked long-polls one user may hold
 # Max queue entries returned by one poll. A user offline while a busy group
 # ran hot can accumulate thousands; without a page the response balloons and
@@ -72,8 +77,13 @@ QUEUE_PAGE = 500
 # notes it fetched with its auth header (fetch -> Blob -> object URL); blob:
 # URLs are same-origin-created media only, so this widens nothing an
 # attacker controls.
-CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
-       "connect-src 'self'; img-src 'self' blob:; "
+# manifest-src is NOT covered by script-/style-/connect-src — it falls back to
+# default-src, which is 'none', so the browser refused /manifest.json outright
+# and the entire PWA surface (name, all five icons, display:standalone,
+# installability) was silently dead. Same-origin static JSON that _static
+# already serves, so naming it here widens nothing.
+CSP = ("default-src 'none'; manifest-src 'self'; script-src 'self'; "
+       "style-src 'self'; connect-src 'self'; img-src 'self' blob:; "
        "media-src 'self' blob:; base-uri 'none'; "
        "form-action 'none'; frame-ancestors 'none'")
 

@@ -45,7 +45,9 @@ def image_mime(head: bytes) -> str | None:
     allowlist: png/jpeg/gif/webp. SVG is intentionally absent (it is
     scriptable XML and must never be served inline), as are formats with
     exotic parser surface (BMP/TIFF/ICO). Comparing a few constant bytes is
-    NOT image parsing — the server still never decodes uploads."""
+    NOT image parsing — the server still never decodes uploads.
+    Allowlist changes are posture changes: see 'Security posture — do NOT
+    weaken' in API.md before touching this list."""
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if head.startswith(b"\xff\xd8\xff"):
@@ -97,6 +99,9 @@ def av_mime(head: bytes, audio_hint: bool = False) -> tuple[str, str] | None:
       never yields a scriptable type. It only narrows an already-verified
       ambiguous container from video to audio. Worst case, a user mislabels
       their own message; there is no cross-user impact.
+
+    Allowlist changes are posture changes: see 'Security posture — do NOT
+    weaken' in API.md before touching this list.
     """
     if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF
                                    and (head[1] & 0xE0) == 0xE0):

@@ -61,8 +61,24 @@ class Api:
         # presence are signals that expire in seconds — writing markers for
         # them would churn the disk for state nobody should ever recover.
         self._typing_lock = threading.Lock()
-        self._typing: dict = {}      # (gid, user) -> expiry (time.time())
-        self._seen: dict = {}        # user -> last authenticated activity
+        self._typing: dict = {}      # (gid, user) -> expiry (time.monotonic())
+        # An update event is named (mid, kind, actor), so a SECOND change by
+        # the same actor collides with the first entry's symlink and queue_add
+        # swallows the FileExistsError. If that happens after we handed the
+        # entry to a client but before the client confirms it, the confirm
+        # retires an entry whose newest change the client never saw — an edit
+        # that never lands, or a "delete for everyone" that silently doesn't.
+        # So remember the link mtime we handed out; _fanout_event re-stamps
+        # the link on a collision, and confirm refuses to unlink an entry that
+        # moved on since. Bounded, and losing the table (restart, overflow)
+        # only degrades to the old behaviour.
+        self._handed_lock = threading.Lock()
+        self._handed: dict = {}      # (user, entry) -> mtime handed to a poll
+        # user -> (wall-clock seconds, monotonic seconds) of last activity.
+        # Both are needed: last_seen is REPORTED to clients (and persisted) so
+        # it must be epoch time, while "online" is an INTERVAL and must not
+        # move when the wall clock steps (see list_queue).
+        self._seen: dict = {}
         self._seen_persisted: dict = {}   # user -> last time we wrote lastseen
 
     # ---- auth --------------------------------------------------------------
@@ -74,11 +90,17 @@ class Api:
             raise ApiError(400, "bad credentials")
         self.login_ip_limiter.check(ip)          # caps distinct-username floods
         self.login_limiter.check(f"{ip}/{user}")  # caps guessing one account
-        auth = self.store.verify_password(user, password)
-        if auth is None:
+        # One lookup answers everything: verify_password returns the user
+        # file's entry only when the hash matches AND the entry isn't
+        # disabled — with flat timing across every failure shape, so the
+        # response can't reveal who is listed. new_session() provisions the
+        # account's directory on this, its first contact.
+        e = self.store.verify_password(user, password)
+        if e is None:
             raise ApiError(401, "bad credentials")
         return {"token": self.store.new_session(user), "user": user,
-                "display": auth["display"], "must_change": auth["must_change"]}
+                "display": e.display or user,
+                "must_change": e.must_change}
 
     def change_password(self, user: str, body: dict, keep_token: str) -> dict:
         old, new = body.get("old", ""), body.get("new", "")
@@ -86,6 +108,14 @@ class Api:
             raise ApiError(400, "bad old password")
         if not isinstance(new, str) or len(new) < 8 or len(new) > 128:
             raise ApiError(400, "new password must be 8..128 chars")
+        # The one endpoint that ran an UNLIMITED password verify. A token
+        # without its password — a laptop left unlocked, a token lifted from
+        # client storage — could guess `old` here at full speed, and the
+        # plaintext is worth more than the token (it survives session
+        # revocation and is probably reused elsewhere). Same budget as
+        # /api/login, keyed on the account; checked after the cheap 400s so a
+        # malformed body never spends it, and before the PBKDF2 it bounds.
+        self.login_limiter.check(f"pw/{user}")
         if self.store.verify_password(user, old) is None:
             raise ApiError(403, "old password wrong")
         self.store.set_password(user, new)
@@ -102,7 +132,7 @@ class Api:
         users/<u>/lastseen is written at most every LASTSEEN_PERSIST_SECS so a
         restart still knows a coarse last-seen without per-request disk churn."""
         now = time.time()
-        self._seen[user] = now
+        self._seen[user] = (now, time.monotonic())
         if now - self._seen_persisted.get(user, 0) > LASTSEEN_PERSIST_SECS:
             self._seen_persisted[user] = now
             try:
@@ -114,7 +144,7 @@ class Api:
     def _last_seen_ms(self, user: str) -> int | None:
         ts = self._seen.get(user)
         if ts:
-            return int(ts * 1000)
+            return int(ts[0] * 1000)
         try:
             return int((self.store.user_dir(user) / "lastseen").read_text())
         except (OSError, ValueError):
@@ -124,7 +154,9 @@ class Api:
         # A parked long-poll called touch_seen when it arrived and re-polls well
         # inside PRESENCE_ONLINE_SECS, so consulting the poll counter told us
         # nothing extra and coupled poll fairness to presence.
-        return time.time() - self._seen.get(user, 0) < PRESENCE_ONLINE_SECS
+        seen = self._seen.get(user)
+        return (seen is not None
+                and time.monotonic() - seen[1] < PRESENCE_ONLINE_SECS)
 
     # ---- typing (ephemeral, in-memory) --------------------------------------
     def typing(self, user: str, body: dict) -> dict:
@@ -139,7 +171,7 @@ class Api:
         # skips one indicator refresh.
         self.typing_limiter.check(user)
         with self._typing_lock:
-            now = time.time()
+            now = time.monotonic()   # a TTL is an interval — see list_queue
             for k in [k for k, exp in self._typing.items() if exp <= now]:
                 del self._typing[k]
             # cap globally AND per user: without the per-user bound one
@@ -156,9 +188,11 @@ class Api:
     def _typing_for(self, user: str) -> dict:
         """{gid: {typist: int(expiry)}} for groups `user` belongs to. The
         expiry is included so a parked poll detects a re-ping (same set, new
-        expiry) as a change and keeps the watcher's indicator alive."""
+        expiry) as a change and keeps the watcher's indicator alive. It is a
+        MONOTONIC stamp and never leaves the process — _typing_payload sends
+        names only — so it is compared, not published."""
         with self._typing_lock:
-            now = time.time()
+            now = time.monotonic()
             snapshot = [(g, u, exp) for (g, u), exp in self._typing.items()
                         if exp > now and u != user]
         out: dict = {}
@@ -176,13 +210,22 @@ class Api:
 
     # ---- queue -------------------------------------------------------------
     def list_queue(self, user: str, wait: float) -> dict:
-        deadline = time.time() + max(0.0, min(wait, MAX_WAIT))
+        # MONOTONIC, never the wall clock: this is an INTERVAL, and the wall
+        # clock steps (a VM resumed from a snapshot, timesyncd's first sync,
+        # chrony stepping an offset over 128ms). A backward step of N seconds
+        # parked every live poll for its wait PLUS N — far past MAX_WAIT —
+        # each one holding a worker thread and one of MAX_CONNECTIONS slots
+        # the whole time, which at a busy deployment turns a clock hiccup into
+        # accept-then-close for everyone. Nothing here is reported to clients,
+        # so the clock swap is invisible outside this method. (Store.next_ts
+        # is hardened against the same step for message ids.)
+        deadline = time.monotonic() + max(0.0, min(wait, MAX_WAIT))
         # First check is always cheap. Only PARKING (waiting) is capped per
         # user, so one account can't tie up unbounded worker threads by opening
         # many concurrent long-polls.
         items = self._queue_items(user)
         typing = self._typing_for(user)
-        if items or time.time() >= deadline:
+        if items or time.monotonic() >= deadline:
             return self._queue_resp(items, typing)
         with self._poll_lock:
             over = self._polls.get(user, 0) >= MAX_POLLS_PER_USER
@@ -196,13 +239,20 @@ class Api:
             return self._queue_resp(items, typing)
         try:
             while True:
+                # A poll parked here was authorized up to 30s ago. Re-check
+                # the user file each pass (one stat) so
+                # revoking someone cuts their live feed within ~a second
+                # instead of letting this request keep delivering to them
+                # until its deadline.
+                if not self.store.roster.allows(user):
+                    raise ApiError(401, "invalid or expired session")
                 items = self._queue_items(user)
                 cur = self._typing_for(user)
                 # return on queue activity, deadline, or a typing-state CHANGE
                 # (start/stop/re-ping) — steady silence keeps the poll parked
-                if items or cur != typing or time.time() >= deadline:
+                if items or cur != typing or time.monotonic() >= deadline:
                     return self._queue_resp(items, cur)
-                self.notifier.wait(user, min(1.0, deadline - time.time()))
+                self.notifier.wait(user, min(1.0, deadline - time.monotonic()))
         finally:
             with self._poll_lock:
                 n = self._polls.get(user, 1) - 1
@@ -235,7 +285,10 @@ class Api:
                 if kind is None and not target.is_dir():
                     link.unlink(missing_ok=True)  # target archived/gone: drop
                     continue
-                at = int(link.lstat().st_mtime * 1000)
+                mtime = link.lstat().st_mtime
+                at = int(mtime * 1000)
+                if kind in ("u", "a"):
+                    self._hand_out(user, link.name, mtime)
             except FileNotFoundError:
                 continue
             item = {"entry": link.name,
@@ -249,13 +302,53 @@ class Api:
             out.append(item)
         return out
 
+    MAX_HANDED = 20_000   # bounds the memory; past it, confirm behaves as before
+
+    def _hand_out(self, user: str, entry: str, mtime: float) -> None:
+        """Note the update entry's current stamp as a poll hands it over."""
+        with self._handed_lock:
+            if (len(self._handed) >= self.MAX_HANDED
+                    and (user, entry) not in self._handed):
+                # Full. Entries are forgotten on confirm, but a symlink the
+                # janitor swept or retention archived — handed out, never
+                # confirmed — stayed here for the life of the process, so the
+                # table filled with ghosts and the guard silently switched
+                # itself off. Shed the ghosts (a stat each, only when full,
+                # so it costs nothing on the normal path) before giving up.
+                for key in [k for k in self._handed
+                            if not (self.store.queue_dir(k[0]) / k[1]).is_symlink()]:
+                    del self._handed[key]
+                if len(self._handed) >= self.MAX_HANDED:
+                    return
+            self._handed[(user, entry)] = mtime
+
+    def _superseded(self, user: str, entry: str, link: Path) -> bool:
+        """True when a NEWER change re-stamped this update entry after a poll
+        handed it out — so confirming it now would drop a change the client
+        has never been told about (the next event for the same message and
+        actor coalesces onto this very symlink and would be swallowed)."""
+        with self._handed_lock:
+            handed = self._handed.get((user, entry))
+        return handed is not None and link.lstat().st_mtime > handed
+
+    def _forget(self, user: str, entry: str) -> None:
+        with self._handed_lock:
+            self._handed.pop((user, entry), None)
+
     def peek(self, user: str, entry: str) -> dict:
         if not MID_RE.match(entry):
             raise ApiError(400, "bad message id")
         link = self.store.queue_dir(user) / entry
         if not link.is_symlink():
             raise ApiError(404, "not in your queue")
-        mdir = Path(os.path.realpath(link))
+        # realpath resolves an already-missing path lexically, but a symlink
+        # unlinked WHILE it resolves (second device draining, or the janitor)
+        # raises FileNotFoundError from the readlink inside — proven by the
+        # concurrency fuzzer. Gone is gone: 404, not 500.
+        try:
+            mdir = Path(os.path.realpath(link))
+        except FileNotFoundError:
+            raise ApiError(404, "message gone")
         gid = self.store.gid_of(mdir)
         if gid is None or not mdir.is_dir():
             raise ApiError(404, "message gone")
@@ -271,7 +364,11 @@ class Api:
         if int(mdir.name[:13]) < self.store.joined_at(gid, user):
             link.unlink(missing_ok=True)
             raise ApiError(404, "message gone")
-        return self.render_msg(mdir, user)
+        try:
+            return self.render_msg(mdir, user)
+        except FileNotFoundError:
+            # the janitor archived this message's day folder mid-render
+            raise ApiError(404, "message gone")
 
     def _stamp(self, mdir: Path, user: str, kind: str) -> bool:
         """One code path for both flags: create the marker and queue the
@@ -300,17 +397,35 @@ class Api:
             if not m:
                 raise ApiError(400, "bad queue entry")
             link = self.store.queue_dir(user) / name
-            if not link.is_symlink():
+            # Two real FileNotFoundError sources in this body, both proven by
+            # the concurrency fuzzer: realpath raises if a second device (or
+            # the janitor) unlinks the symlink mid-resolution (its internal
+            # readlink TOCTOU), and _stamp's mkdir/read raises if the janitor
+            # archives the message dir mid-confirm. Either way the entry's
+            # work is moot — treat the disappearance as done, never a 500.
+            try:
+                if not link.is_symlink():
+                    continue
+                kind = m.group(2)
+                if kind is None:        # a message entry, not a flag event
+                    mdir = Path(os.path.realpath(link))
+                    gid = self.store.gid_of(mdir)
+                    # only stamp delivered if the user is genuinely still a
+                    # member; a stale entry for a left group is just unlinked
+                    if gid and mdir.is_dir() and self.store.is_member(gid, user):
+                        self._stamp(mdir, user, "d")
+                elif kind in ("u", "a") and self._superseded(user, name, link):
+                    # the message changed again between the poll that handed
+                    # this entry over and this confirm: leave it queued so the
+                    # next poll redelivers it. Confirming would retire the
+                    # only carrier the later change has.
+                    continue
+                link.unlink(missing_ok=True)
+                self._forget(user, name)
+                confirmed += 1
+            except FileNotFoundError:
+                self._forget(user, name)
                 continue
-            if m.group(2) is None:  # a message entry, not a flag event
-                mdir = Path(os.path.realpath(link))
-                gid = self.store.gid_of(mdir)
-                # only stamp delivered if the user is genuinely still a member;
-                # a stale entry for a left group is just unlinked
-                if gid and mdir.is_dir() and self.store.is_member(gid, user):
-                    self._stamp(mdir, user, "d")
-            link.unlink(missing_ok=True)
-            confirmed += 1
         return {"confirmed": confirmed}
 
     def viewed(self, user: str, body: dict) -> dict:
@@ -332,11 +447,20 @@ class Api:
             if not self.can_see(user, gid, mid):
                 continue
             mdir = self.store.msg_dir(gid, mid)
-            sender = (mdir / "from").read_text().strip()
-            if sender == user or (mdir / "system").exists():
+            # The same guard confirm puts around the same _stamp call: with
+            # --retain-days set, the janitor can archive this message's day
+            # folder between can_see and here, and then `from`'s read (or
+            # _stamp's mkdir) raises. Without this the request 500s and every
+            # REMAINING id in the batch goes unmarked — one archived message
+            # silently costs the whole batch its read receipts.
+            try:
+                sender = (mdir / "from").read_text().strip()
+                if sender == user or (mdir / "system").exists():
+                    continue
+                if self._stamp(mdir, user, "r"):
+                    marked += 1
+            except FileNotFoundError:
                 continue
-            if self._stamp(mdir, user, "r"):
-                marked += 1
         return {"marked": marked}
 
     # ---- sending -----------------------------------------------------------
@@ -358,7 +482,7 @@ class Api:
         to = body.get("to")
         gid = body.get("gid")
         if isinstance(to, str) and to:
-            if not self.store.user_exists(to):
+            if not self.store.may_connect(to):
                 raise ApiError(404, "no such user")
             if to == user:
                 raise ApiError(400, "cannot message yourself")
@@ -409,13 +533,33 @@ class Api:
         """Queue a payload-less ~a~/~u~ event to EVERY member (including the
         actor — their other devices need it too) and wake them. Receivers
         refetch the message state; the entry itself carries no data."""
+        entry = f"{mid}~{kind}~{actor}"
         for u in self.store.members(gid):
             # a member who joined AFTER this message can't read it, so an event
             # would only leak its existence and wedge an unresolvable entry in
             # their queue
             if int(mid[:13]) < self.store.joined_at(gid, u):
                 continue
-            self.store.queue_add(u, f"{mid}~{kind}~{actor}", mdir)
+            self.store.queue_add(u, entry, mdir)
+            # If the entry already existed (this actor's previous change is
+            # still unconfirmed) the symlink is unchanged and NOTHING on disk
+            # would say a new change happened. Re-stamp it: the queue item's
+            # `at` then reports the latest change, and confirm can tell that a
+            # client holding the older state must not retire the entry.
+            try:
+                link = self.store.queue_dir(u) / entry
+                # STRICTLY newer than whatever stamp a poll may already have
+                # handed out, not merely "now": file timestamps come off the
+                # kernel's coarse clock, so a re-stamp inside the same tick as
+                # the hand-out's lstat would compare EQUAL and confirm would
+                # retire the entry anyway — the exact loss this exists to
+                # stop, now a few microseconds wide instead of a round trip.
+                # max() also survives a backward wall-clock step, which would
+                # otherwise stamp the newer change OLDER than the handed one.
+                ns = max(time.time_ns(), link.lstat().st_mtime_ns + 1)
+                os.utime(link, ns=(ns, ns), follow_symlinks=False)
+            except OSError:
+                pass            # the user was revoked, or their queue is gone
             self.notifier.notify(u)
 
     # ---- reactions / edit / delete ------------------------------------------
@@ -491,8 +635,11 @@ class Api:
         try:
             for metaf in adir.glob("*.meta"):
                 try:
-                    freed += json.loads(metaf.read_text()).get("size", 0)
-                except (OSError, ValueError):
+                    meta = json.loads(metaf.read_text())
+                    freed += meta.get("size", 0)
+                    if isinstance(meta.get("thumb"), dict):   # preview bytes
+                        freed += meta["thumb"].get("size", 0)  # count too
+                except (OSError, ValueError, TypeError, AttributeError):
                     pass
         except OSError:
             pass          # already gone: nothing of ours left to credit
@@ -524,7 +671,8 @@ class Api:
         self.upload_limiter.check(user)   # cap upload rate per user
         udir = self.store.user_dir(user)
         staged = udir / "staged"
-        if sum(1 for p in staged.iterdir() if not p.name.endswith(".meta")) >= MAX_STAGED:
+        if sum(1 for p in staged.iterdir()
+               if not p.name.endswith((".meta", ".thumb"))) >= MAX_STAGED:
             raise ApiError(429, "too many staged uploads; send or wait")
         # RESERVE the bytes under the lock before streaming, so concurrent
         # uploads can't collectively overshoot the quota; credited back if the
@@ -572,8 +720,109 @@ class Api:
             out[av[0]] = av[1]
         return out
 
-    def attachment(self, user: str, gid: str, mid: str, n: str):
-        if not (GID_RE.match(gid) and MID_RE.match(mid) and n.isdigit()
+    MAX_THUMB = 64 * 1024   # a preview is kilobytes; anything bigger is abuse
+
+    def upload_thumb(self, user: str, fid: str, rfile, length: int,
+                     dims: str | None) -> dict:
+        """Sender-generated preview for a STAGED upload. The server stays
+        never-decode: the thumb is opaque bytes that must pass the same
+        image_mime magic-byte allowlist as any inline image (so SVG is
+        structurally impossible), is size-capped, and is presentation-only —
+        the same trust class as the client-supplied filename. X-Media-Dims
+        carries the ORIGINAL's WxH so clients can reserve layout; bounded
+        ints, ignored when malformed."""
+        if not FID_RE.match(fid):
+            raise ApiError(400, "bad file id")
+        if length <= 0 or length > self.MAX_THUMB:
+            raise ApiError(413, f"thumb must be 1..{self.MAX_THUMB} bytes")
+        self.upload_limiter.check(user)
+        staged = self.store.user_dir(user) / "staged"
+        metaf = staged / (fid + ".meta")
+        if not ((staged / fid).is_file() and metaf.is_file()):
+            raise ApiError(404, "unknown file id (upload first)")
+        tdst = staged / (fid + ".thumb")
+        if tdst.exists():
+            raise ApiError(409, "thumb already uploaded")
+        # same reserve-then-stream discipline as upload(): the bytes count
+        # against quota from the first moment they can hit the disk
+        self.store.reserve_storage(user, length, USER_STORAGE_QUOTA)
+        try:
+            body = rfile.read(length)
+            if len(body) != length:
+                raise ApiError(400, "truncated upload")
+            mime = image_mime(body[:16])
+            if not mime:
+                raise ApiError(400, "thumb must be a png/jpeg/gif/webp image")
+            # A UNIQUE tmp name, and an atomic claim on the destination.
+            # The tdst.exists() check above is a cheap early out, not the
+            # guard: concurrent thumbs for one fid all passed it, all charged
+            # the quota (the counter drifted 2-5x over reality until the next
+            # hourly recount, spuriously 413ing legitimate uploads), collided
+            # on the shared tmp path so one racer's os.replace raised
+            # FileNotFoundError -> 500 instead of the documented 409, and the
+            # loser's meta could end up describing the winner's bytes — an
+            # ETag that does not match what ?thumb=1 serves. os.link fails if
+            # the name exists, so exactly one racer wins.
+            tmp = self.store.root / "tmp" / f"t-{fid}-{secrets.token_hex(8)}"
+            with open(tmp, "wb") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(body)
+            try:
+                os.link(tmp, tdst)
+            except FileExistsError:
+                raise ApiError(409, "thumb already uploaded")
+            finally:
+                tmp.unlink(missing_ok=True)
+            try:
+                meta = json.loads(metaf.read_text())
+                if not isinstance(meta, dict):
+                    raise ValueError
+                meta["thumb"] = {"size": length, "mime": mime,
+                                 "sha256": hashlib.sha256(body).hexdigest()}
+                w, h = self._parse_dims(dims)
+                if w:
+                    meta["w"], meta["h"] = w, h
+                self.store.write_atomic(metaf, json.dumps(meta).encode())
+            except (OSError, ValueError):
+                # the staged file was consumed by a racing send (meta gone) or
+                # is corrupt: the thumb has nowhere to attach. Benign by
+                # design — the send proceeded thumbless; undo our half.
+                tdst.unlink(missing_ok=True)
+                raise ApiError(409, "file already sent")
+        except Exception:
+            self.store.add_storage(user, -length)   # release the reservation
+            raise
+        return {"ok": True, "thumb": mime}
+
+    @staticmethod
+    def _parse_dims(dims: str | None) -> tuple[int, int]:
+        """'WxH' with bounded ASCII ints, or (0, 0). Presentation-only, so a
+        lying client can only mis-shape its own message's placeholder."""
+        if not dims:
+            return 0, 0
+        w_s, sep, h_s = dims.partition("x")
+        # length cap BEFORE int(): a >=4301-digit string trips Python's
+        # int-string conversion limit and raises ValueError (not the (0,0) the
+        # contract promises), which upstream would misread as "file already
+        # sent" and drop a perfectly good thumb. Max is 10000 → 5 digits.
+        if not (sep and w_s.isascii() and w_s.isdigit() and len(w_s) <= 5
+                and h_s.isascii() and h_s.isdigit() and len(h_s) <= 5):
+            return 0, 0
+        w, h = int(w_s), int(h_s)
+        if not (1 <= w <= 10000 and 1 <= h <= 10000):
+            return 0, 0
+        return w, h
+
+    def attachment(self, user: str, gid: str, mid: str, n: str,
+                   thumb: bool = False):
+        # Two traps, both of which end in int() raising ValueError → 500 on
+        # a path segment any authenticated user picks: `str.isdigit()` is True
+        # for non-ASCII digits like "¹" (superscript one), and a string of
+        # more than 4300 digits exceeds Python's int-conversion limit. Pin to
+        # ASCII 0-9 AND bound the length before int() sees it — MAX_ATTACHMENTS
+        # is single-digit, so three characters is already generous.
+        if not (GID_RE.match(gid) and MID_RE.match(mid)
+                and n.isascii() and n.isdigit() and len(n) <= 3
                 and 1 <= int(n) <= MAX_ATTACHMENTS):
             raise ApiError(400, "bad attachment path")
         if not self.store.is_member(gid, user):
@@ -581,11 +830,43 @@ class Api:
         if int(mid[:13]) < self.store.joined_at(gid, user):
             raise ApiError(404, "no such attachment")  # pre-join: invisible
         mdir = self.store.msg_dir(gid, mid)
+        # A deleted message's tombstone is authoritative (render_msg blanks its
+        # text). Attachment bytes are dropped right after the tombstone is
+        # claimed, but if that step was interrupted (crash/ENOSPC) the blobs can
+        # linger — never serve them, or "delete for everyone" leaks its content.
+        if (mdir / "deleted").is_file():
+            raise ApiError(404, "no such attachment")
         blob = mdir / "attachments" / str(int(n))
         metaf = mdir / "attachments" / f"{int(n)}.meta"
         if not (blob.is_file() and metaf.is_file()):
             raise ApiError(404, "no such attachment")
-        meta = json.loads(metaf.read_text())
+        # Mirror render_msg's tolerant meta parse: a crash-partial or hand-
+        # mangled .meta is "gone", never a 500 — and the caller feeds meta
+        # straight into response headers (name, size, sha256, media type), so
+        # a meta that parses but isn't the dict the upload wrote must not get
+        # that far either. OSError covers a delete rmtree'ing the file
+        # between the is_file check and the read.
+        try:
+            meta = json.loads(metaf.read_text())
+        except (OSError, ValueError):
+            raise ApiError(404, "attachment meta unreadable")
+        if not (isinstance(meta, dict) and "name" in meta and "size" in meta):
+            raise ApiError(404, "attachment meta unreadable")
+        if thumb:
+            # ?thumb=1: swap in the preview blob under a REMAPPED meta, so the
+            # route serves it through the identical _send_blob path — same
+            # sandbox/nosniff/CORP set, its own sha256 as the cache validator.
+            # The thumb passed image_mime at upload, so "image" is always the
+            # verified inline type here.
+            t = meta.get("thumb")
+            tblob = mdir / "attachments" / f"{int(n)}.thumb"
+            if not (isinstance(t, dict) and t.get("mime")
+                    and tblob.is_file()):
+                raise ApiError(404, "no thumbnail for this attachment")
+            return tblob, {"name": "thumb-" + meta["name"],
+                           "size": t.get("size", 0),
+                           "sha256": t.get("sha256"),
+                           "image": t["mime"]}
         return blob, meta
 
     # ---- reading -----------------------------------------------------------
@@ -597,8 +878,12 @@ class Api:
         mid = mdir.name
         atts = []
         adir = mdir / "attachments"
-        if adir.is_dir():
-            for metaf in sorted(adir.glob("*.meta")):
+        try:
+            # A concurrent delete rmtree's this dir between is_dir and the
+            # glob (pathlib's glob raises FileNotFoundError when the dir
+            # vanishes mid-scan), and can remove individual meta files under
+            # the read. Either way the bytes are going: render no attachments.
+            for metaf in sorted(adir.glob("*.meta")) if adir.is_dir() else []:
                 try:
                     meta = json.loads(metaf.read_text())
                     a = {"n": int(metaf.name.split(".")[0]),
@@ -610,9 +895,15 @@ class Api:
                         a["audio"] = meta["audio"]
                     if meta.get("video"):   # ditto — inline <video> playback
                         a["video"] = meta["video"]
+                    if isinstance(meta.get("thumb"), dict):
+                        a["thumb"] = True   # fetch via ?thumb=1
+                    if meta.get("w") and meta.get("h"):
+                        a["w"], a["h"] = meta["w"], meta["h"]
                     atts.append(a)
-                except (ValueError, KeyError):
+                except (OSError, ValueError, KeyError):
                     continue
+        except OSError:
+            atts = []
         gid = self.store.gid_of(mdir)
         sender = (mdir / "from").read_text().strip()
         at = int(mid[:13])
@@ -700,7 +991,11 @@ class Api:
         flags-only response, under the same authorization."""
         if not (GID_RE.match(gid) and MID_RE.match(mid)):
             raise ApiError(400, "bad ids")
-        return self.render_msg(self._visible_mdir(user, gid, mid), user)
+        try:
+            return self.render_msg(self._visible_mdir(user, gid, mid), user)
+        except FileNotFoundError:
+            # the janitor archived this message's day folder mid-render
+            raise ApiError(404, "message gone")
 
     def history(self, user: str, gid: str, before: str | None, limit: int) -> dict:
         if not GID_RE.match(gid):
@@ -717,7 +1012,10 @@ class Api:
                 break  # newest-first: everything after this predates the join
             if before and mdir.name >= before:
                 continue
-            out.append(self.render_msg(mdir, user))
+            try:
+                out.append(self.render_msg(mdir, user))
+            except FileNotFoundError:
+                continue   # day folder archived mid-walk: skip, don't 500
             if len(out) >= limit:
                 break
         return {"messages": out}
@@ -770,7 +1068,10 @@ class Api:
             if not self.can_see(user, gid, mid) or (mdir / "deleted").is_file():
                 marker.unlink(missing_ok=True)
                 continue
-            out.append(self.render_msg(mdir, user))
+            try:
+                out.append(self.render_msg(mdir, user))
+            except FileNotFoundError:
+                continue   # message archived mid-walk: prune on next pass
             if len(out) >= 200:
                 break
         return {"messages": out}
@@ -892,19 +1193,19 @@ class Api:
         if not (isinstance(members, list)
                 and all(isinstance(u, str) and USER_RE.match(u) for u in members)):
             raise ApiError(400, "bad members list")
-        roster = set(members) | {user}
-        if not 2 <= len(roster) <= MAX_GROUP_MEMBERS:
+        founding = set(members) | {user}
+        if not 2 <= len(founding) <= MAX_GROUP_MEMBERS:
             raise ApiError(400, f"groups need 2..{MAX_GROUP_MEMBERS} members")
-        for u in roster:
-            if not self.store.user_exists(u):
+        for u in founding:
+            if not self.store.may_connect(u):
                 raise ApiError(404, f"no such user: {u}")
-        gid = self.store.create_group(name, roster)
+        gid = self.store.create_group(name, founding)
         # announce in-band: this is how the other members' clients learn the
         # group exists at all (it lands in their queues like any message)
         self.store.spool_system(user, gid, f"{user} created “{name}”",
                                 {"event": "created", "name": name, "by": user})
         self.router.wake.set()
-        return {"gid": gid, "members": sorted(roster)}
+        return {"gid": gid, "members": sorted(founding)}
 
     def modify_members(self, user: str, gid: str, body: dict) -> dict:
         if not GID_RE.match(gid) or gid.startswith("d-"):
@@ -919,7 +1220,7 @@ class Api:
         # validate EVERYTHING before mutating anything, so a bad `remove` can't
         # leave the `add`s (and their join announcements) half-committed
         for u in add:
-            if not (isinstance(u, str) and self.store.user_exists(u)):
+            if not (isinstance(u, str) and self.store.may_connect(u)):
                 raise ApiError(404, f"no such user: {u}")
         for u in remove:
             if u != user:
@@ -942,11 +1243,17 @@ class Api:
             self.store.spool_system(u, gid, f"{u} left",
                                     {"event": "leave", "user": u})
             (md / u).unlink(missing_ok=True)
-            # leaving sweeps this group's entries out of the leaver's queue
+            # leaving sweeps this group's entries out of the leaver's queue.
+            # realpath raises FileNotFoundError if a concurrent drain unlinks
+            # the symlink mid-resolution (its internal readlink TOCTOU) — the
+            # entry is gone either way, which is what this sweep wanted.
             for link in self.store.queue_dir(u).iterdir():
-                if (link.is_symlink()
-                        and self.store.gid_of(os.path.realpath(link)) == gid):
-                    link.unlink(missing_ok=True)
+                try:
+                    if (link.is_symlink()
+                            and self.store.gid_of(os.path.realpath(link)) == gid):
+                        link.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    continue
         self.router.wake.set()
         return {"members": self.store.members(gid)}
 
@@ -963,14 +1270,18 @@ class Api:
 
     def list_users(self) -> dict:
         res = []
-        for udir in sorted((self.store.root / "users").iterdir()):
-            try:
-                auth = json.loads((udir / "auth.json").read_text())
-            except (OSError, ValueError):
+        # The FILE is the directory: everyone listed (and not disabled)
+        # appears — including colleagues who have never logged in, who are
+        # thereby DM-able from day zero (their queue is provisioned by the
+        # first message routed to them). Accounts whose line was removed
+        # vanish here even though their data is still on disk.
+        for name, e in sorted(self.store.roster.entries().items()):
+            if e.disabled:
                 continue
-            u = {"user": udir.name, "display": auth.get("display", udir.name),
-                 "online": self._online(udir.name)}
-            seen = self._last_seen_ms(udir.name)
+            u = {"user": name,
+                 "display": e.display or name,
+                 "online": self._online(name)}
+            seen = self._last_seen_ms(name)
             if seen:
                 u["last_seen"] = seen
             res.append(u)

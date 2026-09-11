@@ -3,8 +3,8 @@ files, and symlinks. Every mutation is an atomic create/rename/unlink so
 readers never observe partial state. This module is the on-disk data model."""
 from __future__ import annotations
 
+import errno
 import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -15,17 +15,28 @@ from pathlib import Path
 
 from .config import (GID_RE, MID_RE, USER_RE, PBKDF2_ITERS, SESSION_IDLE_DAYS)
 from .errors import ApiError
+from .roster import Roster
 from .util import now_ms, mid_date, msg_dirs_newest_first
 
 class Store:
     """All state lives under one data dir; every mutation is an atomic
     create/rename/unlink so readers never see partial state."""
 
-    def __init__(self, root, iters: int = PBKDF2_ITERS):
+    def __init__(self, root, iters: int = PBKDF2_ITERS, roster=None):
         self.root = Path(root).resolve()
         self.iters = iters
+        # THE user database: one passwd-style file, password hash last field
+        # (see roster.py). Defaults to <data>/passwd; --roster overrides.
+        # Absent file = zero users until it exists.
+        self.roster = Roster(Path(roster) if roster else self.root / "passwd")
         self._id_lock = threading.Lock()
         self._quota_lock = threading.Lock()
+        # Held by the router across the ONE rename that moves a message out of
+        # incoming/, and by recount_all_storage across its walk of incoming/.
+        # Without it the walk and the rename race: the walk lists a message in
+        # incoming/, the router moves it, the walk's read fails and counts 0 —
+        # or the walk counts it AND the later groups/ walk counts it again.
+        self._route_lock = threading.Lock()
         for name in ("tmp", "incoming", "users", "groups", "archive", "rejected"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         # High-water mark for the message-id clock, persisted so a restart
@@ -35,6 +46,39 @@ class Store:
             self._last_ms = int(self._hwm_path.read_text())
         except (OSError, ValueError):
             self._last_ms = 0
+        # Defence in depth: the hwm write is best-effort, so a lost/stale hwm
+        # plus a backward clock step could issue ids BELOW existing on-disk
+        # stamps. Below a join stamp, new messages are silently hidden behind
+        # the join-gate; below existing message ids, history order corrupts and
+        # a new message can land in a day folder old enough for the janitor to
+        # archive it immediately. Seed the floor from both: every join stamp
+        # (one small file per membership) and the newest message id per group
+        # (msg_dirs_newest_first is lazy — day names plus one day's entries).
+        self._last_ms = max(self._last_ms, self._clock_floor())
+
+    def _clock_floor(self) -> int:
+        floor = 0
+        groups = self.root / "groups"
+        try:
+            gdirs = list(groups.iterdir())
+        except OSError:
+            return floor
+        for gdir in gdirs:
+            try:
+                for mf in (gdir / "members").iterdir():
+                    try:
+                        floor = max(floor, int(mf.read_text().strip() or 0))
+                    except (OSError, ValueError):
+                        pass
+            except OSError:
+                pass
+            newest = next(msg_dirs_newest_first(gdir), None)
+            if newest is not None:
+                try:
+                    floor = max(floor, int(newest.name[:13]))
+                except ValueError:
+                    pass
+        return floor
 
     def next_ts(self) -> int:
         """A strictly-increasing millisecond stamp on ONE clock — persisted and
@@ -129,17 +173,50 @@ class Store:
                 groups.extend(root.iterdir())   # archived bytes are still bytes
             except FileNotFoundError:
                 pass
+        def count_msg(mdir: Path) -> None:
+            try:
+                sender = (mdir / "from").read_text().strip()
+                if sender not in totals:
+                    return                # unknown/removed account
+                for blob in (mdir / "attachments").iterdir():
+                    if not blob.name.endswith(".meta"):
+                        totals[sender] += blob.stat().st_size
+            except OSError:
+                return
+
+        # incoming/ FIRST, under the route lock: send() returns the moment a
+        # message is spooled and the router is woken, so its bytes live here
+        # until the router thread gets scheduled — under load, long enough for
+        # a recount to run in between and refund the sender for a message that
+        # is durable and about to be delivered. The lock pins every message
+        # listed here in place while it is counted; the mids are remembered so
+        # the groups/ walk below, which runs after the lock is released and
+        # may find the same message freshly routed, cannot count it twice.
+        counted: set[str] = set()
+        with self._route_lock:
+            try:
+                for mdir in (self.root / "incoming").iterdir():
+                    if mdir.is_dir():
+                        count_msg(mdir)
+                        counted.add(mdir.name)
+            except FileNotFoundError:
+                pass
         for gdir in groups:
             for mdir in msg_dirs_newest_first(gdir):
-                try:
-                    sender = (mdir / "from").read_text().strip()
-                    if sender not in totals:
-                        continue          # unknown/removed account
-                    for blob in (mdir / "attachments").iterdir():
-                        if not blob.name.endswith(".meta"):
-                            totals[sender] += blob.stat().st_size
-                except OSError:
-                    continue
+                if mdir.name not in counted:
+                    count_msg(mdir)
+        # rejected/: bounced messages, which nothing reclaimed. Leaving them
+        # out meant the hourly recount refunded the sender while the blobs
+        # stayed forever — race a send against leaving the group, park up to
+        # 8x50MB per win, get the allowance back an hour later. Message dirs,
+        # not group dirs, so walked directly; a bounce is a rename too, hence
+        # the same mid guard.
+        try:
+            for mdir in (self.root / "rejected").iterdir():
+                if mdir.is_dir() and mdir.name not in counted:
+                    count_msg(mdir)
+        except FileNotFoundError:
+            pass
         for user, total in totals.items():
             with self._quota_lock:
                 try:
@@ -170,46 +247,85 @@ class Store:
                               str(used + length).encode())
 
     # ---- users / auth ----------------------------------------------------
+    # The user FILE (see roster.py) is the entire user database: identity,
+    # display, flags, and the password hash as its last field. There is no
+    # per-account credential file, and no manual provisioning step: an
+    # account's directory tree is created on FIRST CONTACT — the first
+    # successful login, or the first message routed to the user.
+
     def add_user(self, user: str, password: str, display: str | None = None,
                  must_change: bool = True) -> None:
-        if not USER_RE.match(user):
-            raise ApiError(400, "bad username (allowed: [a-z0-9_.-]{1,32})")
+        """Append the user to the file (nothing else): the directory follows
+        on first contact. Hashing happens before any write, so a failure
+        anywhere can never leave a half-made entry behind."""
+        from .roster import make_hash
+        self.roster.add_entry(user, display, make_hash(password, self.iters),
+                              must_change=must_change)
+
+    def provision(self, user: str) -> None:
+        """Create the account's directory tree, idempotently. Built whole in
+        tmp/ and renamed in atomically: a crash leaves only a tmp orphan
+        (janitor-pruned) and a concurrent first-contact race is settled by
+        the rename — the loser just uses the winner's tree."""
         d = self.user_dir(user)
-        if d.exists():
-            raise ApiError(409, "user exists")
+        if d.is_dir():
+            return
+        tmp = self.root / "tmp" / f"u-{user}-{secrets.token_hex(4)}"
         for sub in ("sessions", "queue", "staged", "nonces", "starred"):
-            (d / sub).mkdir(parents=True)
-        salt = secrets.token_bytes(16)
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, self.iters)
-        auth = {"display": display or user, "salt": salt.hex(), "hash": h.hex(),
-                "iters": self.iters, "must_change": must_change, "created": now_ms()}
-        self.write_atomic(d / "auth.json", json.dumps(auth).encode())
+            (tmp / sub).mkdir(parents=True)
+        try:
+            os.rename(tmp, d)
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if e.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR):
+                return                    # someone else provisioned: done
+            raise ApiError(503, "user provisioning failed, please retry")
 
     def user_exists(self, user: str) -> bool:
-        return bool(USER_RE.match(user)) and (self.user_dir(user) / "auth.json").is_file()
+        """Listed in the user file, disabled or not. Admin paths (passwd
+        reset, bouncing a message back to its sender) act on listed users
+        whether or not they may currently connect."""
+        return (bool(USER_RE.match(user))
+                and self.roster.entry(user) is not None)
 
-    def verify_password(self, user: str, password: str) -> dict | None:
-        try:
-            auth = json.loads((self.user_dir(user) / "auth.json").read_text())
-        except (FileNotFoundError, ValueError):
-            # burn comparable time so unknown users aren't distinguishable
-            hashlib.pbkdf2_hmac("sha256", password.encode(), b"x" * 16, self.iters)
+    def may_connect(self, user: str) -> bool:
+        """Listed AND not disabled — someone who can actually be a party to
+        a conversation. The predicate every "is that a real user?" check in
+        the API wants: a disabled/removed account must not be DM-able or
+        addable to a group, because nothing sent to it can ever be read."""
+        return bool(USER_RE.match(user)) and self.roster.allows(user)
+
+    def verify_password(self, user: str, password: str):
+        """The file's entry when the password matches, else None. Timing is
+        flat across every failure shape: unknown user, password-less entry,
+        malformed hash spec, and wrong password all cost one PBKDF2; the
+        `disabled` check runs AFTER the hash for the same reason."""
+        from .roster import check_hash, burn
+        e = self.roster.entry(user)
+        # what a REAL verify against this file costs — not self.iters, which
+        # is what the next hash we WRITE will cost. The two differ for as long
+        # as it takes everyone to change their password after an operator
+        # raises PBKDF2_ITERS, and burning the wrong one makes an unknown
+        # username measurably slower (or faster) than a known one.
+        cost = self.roster.hash_cost(self.iters)
+        if e is None or not e.password:
+            burn(cost)
             return None
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(),
-                                bytes.fromhex(auth["salt"]), auth["iters"])
-        return auth if hmac.compare_digest(h.hex(), auth["hash"]) else None
+        if not check_hash(password, e.password, cost):
+            return None
+        return None if e.disabled else e
 
     def set_password(self, user: str, password: str,
                      must_change: bool = False) -> None:
-        auth = json.loads((self.user_dir(user) / "auth.json").read_text())
-        salt = secrets.token_bytes(16)
-        h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, self.iters)
-        auth.update(salt=salt.hex(), hash=h.hex(), iters=self.iters,
-                    must_change=must_change)
-        self.write_atomic(self.user_dir(user) / "auth.json", json.dumps(auth).encode())
+        from .roster import make_hash
+        self.roster.set_password(user, make_hash(password, self.iters),
+                                 must_change=must_change)
 
     # ---- sessions (token = "<user>:<secret>", stored as sha256 marker) ----
     def new_session(self, user: str) -> str:
+        # first contact, post successful auth: the account's tree appears the
+        # first time a session is actually issued
+        self.provision(user)
         token = f"{user}:{secrets.token_urlsafe(32)}"
         (self.user_dir(user) / "sessions" /
          hashlib.sha256(token.encode()).hexdigest()).touch()
@@ -218,6 +334,14 @@ class Store:
     def session_user(self, token: str) -> str | None:
         user, sep, _ = token.partition(":")
         if not sep or not USER_RE.match(user):
+            return None
+        # Revocation has to reach ALREADY-ISSUED tokens, or removing someone
+        # from the roster wouldn't remove them from the server — it would
+        # only stop them logging in again. Checked before the session marker
+        # is touched, so a revoked token's mtime is never refreshed either.
+        # The marker is NOT deleted: a transiently unreadable roster denies
+        # (fail closed) but must not log everybody out permanently.
+        if not self.roster.allows(user):
             return None
         p = (self.user_dir(user) / "sessions" /
              hashlib.sha256(token.encode()).hexdigest())
@@ -325,7 +449,17 @@ class Store:
         except FileExistsError:
             pass
         except FileNotFoundError:
-            pass  # user deleted underneath us
+            # Either the user was deleted underneath us, or they are LISTED
+            # but have never logged in: first contact can be a message routed
+            # TO someone (a DM to a colleague who hasn't installed the app
+            # yet must queue, not vanish). Provision and retry once.
+            if self.roster.entry(user) is None:
+                return
+            try:
+                self.provision(user)
+                os.symlink(rel, link)
+            except (OSError, ApiError):
+                pass
 
     # ---- messages ----------------------------------------------------------
     def _spool_dir(self, mid: str, gid: str, sender: str, text: str) -> Path:
@@ -368,6 +502,22 @@ class Store:
                 for i, (src, meta) in enumerate(srcs, 1):
                     os.replace(src, b / "attachments" / str(i))
                     os.replace(meta, b / "attachments" / f"{i}.meta")
+                    # The optional preview rides along ONLY if the meta commits
+                    # to it. upload_thumb writes the .thumb file BEFORE recording
+                    # it in the meta, so a "thumb" key implies the file; a
+                    # .thumb without the key is an upload still in flight —
+                    # leaving it in staged lets upload_thumb's own meta-gone path
+                    # (or the janitor) reclaim it, instead of stranding an
+                    # un-servable orphan whose bytes drift the quota counter.
+                    tsrc = src.with_name(src.name + ".thumb")
+                    if tsrc.is_file():
+                        try:
+                            committed = "thumb" in json.loads(
+                                (b / "attachments" / f"{i}.meta").read_text())
+                        except (OSError, ValueError):
+                            committed = False
+                        if committed:
+                            os.replace(tsrc, b / "attachments" / f"{i}.thumb")
                 os.replace(b, self.root / "incoming" / mid)
             except OSError:  # janitor pruned a staged file mid-move, or fs error
                 shutil.rmtree(b, ignore_errors=True)
@@ -375,7 +525,17 @@ class Store:
         except Exception:
             nf.unlink(missing_ok=True)  # release the claim so a retry can work
             raise
-        self.write_atomic(nf, mid.encode())  # publish the mid last
+        try:
+            self.write_atomic(nf, mid.encode())  # publish the mid last
+        except OSError:
+            # The message is already durable in incoming/ and WILL deliver once;
+            # we just couldn't record the dedup mid. Releasing the empty claim
+            # beats leaving it: a lingering empty nonce 503s every retry for an
+            # hour (until the janitor prunes it) and then duplicates the send.
+            # The message is sent, so hand back its id. A client retry that
+            # races this narrow window could still duplicate — far rarer than
+            # the guaranteed wedge-then-duplicate it replaces.
+            nf.unlink(missing_ok=True)
         return mid
 
     def _await_nonce(self, nf: Path) -> str:

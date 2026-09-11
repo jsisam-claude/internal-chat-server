@@ -4,7 +4,7 @@ behind a threading HTTPS server."""
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import ssl
 import threading
 import traceback
@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
-from .config import CSP, STATIC_TYPES, MAX_JSON, MAX_WAIT, MAX_CONNECTIONS
+from .config import (CSP, STATIC_TYPES, MAX_JSON, MAX_WAIT, MAX_CONNECTIONS,
+                      HANDSHAKE_TIMEOUT)
 from .errors import ApiError
 from .util import log
 from .store import Store
@@ -20,12 +21,54 @@ from .notifier import Notifier
 from .router import Router
 from .api import Api
 
+def _reject_surrogates(obj) -> None:
+    """Walk a parsed JSON value and raise 400 if any string holds a lone
+    surrogate (\\ud800-\\udfff). Such strings decode fine but crash on UTF-8
+    encode; bounded by MAX_JSON so the walk is cheap. Iterative on purpose:
+    a recursive walk's stack budget would ride on json.loads having stricter
+    recursion accounting, which is a CPython detail, not a guarantee."""
+    stack = [obj]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, str):
+            if any("\ud800" <= c <= "\udfff" for c in o):
+                raise ApiError(400, "bad json")
+        elif isinstance(o, dict):
+            stack.extend(o.keys())
+            stack.extend(o.values())
+        elif isinstance(o, list):
+            stack.extend(o)
+
+
+# Bigger than any file, small enough to stay a machine word. A range spec
+# longer than 19 digits saturates to this instead of being converted.
+_OFFSET_MAX = 1 << 63
+
+
+def _offset(s: str) -> int | None:
+    """A byte offset from a Range header, or None if it is not one.
+
+    Two guards before int(), both of which are otherwise a ValueError → 500
+    on a path whose contract (and this module's docstring, and API.md) says
+    malformed input is IGNORED: `str.isdigit()` is True for non-ASCII digits
+    like "¹", and Python refuses to convert a string of more than 4300 digits
+    (sys.get_int_max_str_digits), so `Range: bytes=<4301 nines>-` was a
+    guaranteed 500 on every attachment. Over-long specs SATURATE rather than
+    return None, so an absurd offset stays an unsatisfiable range (416) like
+    a merely-huge one, instead of silently becoming a full 200.
+    (api._parse_dims and api.attachment carry the same guard.)"""
+    if not (s.isascii() and s.isdigit()):
+        return None
+    return int(s) if len(s) <= 19 else _OFFSET_MAX
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 75  # must exceed MAX_WAIT so long-polls aren't cut off
     server_version = "internal-chat"
     api: Api  # bound by build_server()
     static_dir: Path | None = None
+    _head = False  # per-request "suppress the body" flag; reset in _dispatch
 
     # ---- plumbing ----------------------------------------------------------
     def log_message(self, fmt, *args):  # quiet 2xx; log the rest
@@ -51,7 +94,8 @@ class Handler(BaseHTTPRequestHandler):
         self._hsts()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if not self._head:   # HEAD: true Content-Length, zero body bytes
+            self.wfile.write(data)
 
     def _json_body(self) -> dict:
         try:
@@ -61,11 +105,17 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < length <= MAX_JSON:
             raise ApiError(400, "missing or oversized body")
         try:
+            # RecursionError: a deeply-nested "[[[[..." blows the parser's C
+            # recursion limit; without catching it a malformed body 500s.
             body = json.loads(self.rfile.read(length))
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             raise ApiError(400, "bad json")
         if not isinstance(body, dict):
             raise ApiError(400, "bad json")
+        # JSON permits "\ud800" (a lone surrogate) but UTF-8 cannot encode it,
+        # so any downstream `.encode()` (password hashing, message.txt, emoji,
+        # group names) would raise UnicodeEncodeError → 500. Reject at the door.
+        _reject_surrogates(body)
         return body
 
     def _user(self) -> str:
@@ -82,10 +132,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._dispatch("GET")
 
+    def do_HEAD(self):
+        self._dispatch("HEAD")
+
     def do_POST(self):
         self._dispatch("POST")
 
     def _dispatch(self, method: str) -> None:
+        # HEAD rides the GET routing table (RFC 9110 §9.3.2: identical
+        # headers, no body): same auth, same visibility gates, same read-only
+        # api calls — only the body bytes are suppressed, at the three send_*
+        # sinks — so the two methods can never diverge. The flag is
+        # per-REQUEST state on a per-CONNECTION handler instance, so it must
+        # be reset here on every request: the class default alone would let
+        # one HEAD bleed body-suppression into the next keep-alive request.
+        self._head = method == "HEAD"
+        if self._head:
+            method = "GET"
         try:
             url = urlsplit(self.path)
             parts = [p for p in url.path.split("/") if p]
@@ -147,6 +210,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(api.star(self._user(), self._json_body()))
             if p == ["typing"]:
                 return self._send_json(api.typing(self._user(), self._json_body()))
+            if len(p) == 3 and p[0] == "files" and p[2] == "thumb":
+                user = self._user()
+                try:
+                    tlen = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    tlen = 0
+                return self._send_json(api.upload_thumb(
+                    user, p[1], self.rfile, tlen,
+                    self.headers.get("X-Media-Dims")))
             if p == ["files"]:
                 user = self._user()
                 try:
@@ -174,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
                 wait = float(q.get("wait", ["0"])[0])
             except ValueError:
                 wait = 0.0
+            if wait != wait:   # NaN: min(nan, MAX_WAIT) stays nan and the poll
+                wait = 0.0     # deadline never elapses, wedging a worker thread
             return self._send_json(api.list_queue(self._user(), wait))
         if len(p) == 3 and p[:2] == ["message", "dequeue"]:
             return self._send_json(api.peek(self._user(), p[2]))
@@ -204,7 +278,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._user(), q.get("q", [""])[0],
                 q.get("gid", [None])[0], limit))
         if len(p) == 4 and p[0] == "attachments":
-            blob, meta = api.attachment(self._user(), p[1], p[2], p[3])
+            blob, meta = api.attachment(self._user(), p[1], p[2], p[3],
+                                        thumb=q.get("thumb", ["0"])[0] == "1")
             # inline rendering is allowed ONLY for media the server verified
             # by magic bytes at upload — the request cannot force it
             media = (meta.get("image") or meta.get("audio")
@@ -213,37 +288,201 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_blob(blob, meta["name"], meta["size"],
                                    ctype=media if inline
                                    else "application/octet-stream",
-                                   inline=inline)
+                                   inline=inline,
+                                   sha256=meta.get("sha256"))
         if p == ["client", "version"]:
+            # The ONE endpoint with no self._user(). Deliberate, and harmless:
+            # it echoes static_dir/version.json, which the static route
+            # already serves unauthenticated at /version.json, describing an
+            # APK that /download/app.apk hands to anyone. Requiring a session
+            # here would hide nothing and would break an updater that has to
+            # check before one exists. API.md §7 states the exception.
             if self.static_dir and (self.static_dir / "version.json").is_file():
                 return self._send_static(self.static_dir / "version.json")
             raise ApiError(404, "no client published")
         raise ApiError(404, "not found")
 
     # ---- byte responses ------------------------------------------------------
+    @staticmethod
+    def _parse_range(header: str | None, fsize: int):
+        """Parse a single-range 'bytes=' header against a file of `fsize`
+        bytes. Returns an inclusive (start, end) window, None to serve the
+        full body, or "unsat" (→ 416). Anything malformed — and multipart
+        ranges, which we choose not to serve — is None, not an error: RFC
+        9110 §14.2 lets a server ignore any Range header and a full 200 is
+        always a correct answer, so this parser never needs to be clever.
+        Offsets go through _offset(), which pins them to ASCII digits AND
+        caps their length: int("¹") raises after isdigit() passes, and so
+        does a 4301-digit string (the same two traps api.attachment and
+        api._parse_dims guard)."""
+        if not header or not header.startswith("bytes="):
+            return None
+        spec = header[6:].strip()
+        if "," in spec:
+            return None            # multipart: ignorable per RFC, so ignore
+        start_s, sep, end_s = spec.partition("-")
+        if not sep:
+            return None
+        if not start_s:            # suffix form "bytes=-N": the last N bytes
+            n = _offset(end_s)
+            if n is None:
+                return None
+            # "-0" asks for zero bytes and an empty file has no last byte:
+            # both are satisfiable-by-nothing → 416, not a zero-length 206
+            if n == 0 or fsize == 0:
+                return "unsat"
+            return (max(fsize - n, 0), fsize - 1)
+        start = _offset(start_s)
+        if start is None:
+            return None
+        if end_s:
+            end = _offset(end_s)
+            if end is None:
+                return None
+            if end < start:
+                return None        # last < first: invalid spec → serve full
+            end = min(end, fsize - 1)
+        else:
+            end = fsize - 1        # open-ended "bytes=a-": to EOF
+        if start >= fsize:
+            return "unsat"         # nothing at/after EOF to serve
+        return (start, end)
+
+    def _inm_match(self, etag: str) -> bool:
+        """True if the request's If-None-Match matches `etag`. GET/HEAD
+        revalidation uses WEAK comparison (RFC 9110 §13.1.2), so the W/
+        marker and quotes are stripped, any candidate in the list may match,
+        and '*' matches any representation that exists — which this one does,
+        or we would have 404ed before getting here."""
+        inm = self.headers.get("If-None-Match")
+        if not inm:
+            return False
+        bare = etag.strip('"')
+        for cand in inm.split(","):
+            cand = cand.strip()
+            if cand == "*":
+                return True
+            if cand.startswith("W/"):
+                cand = cand[2:].strip()
+            if cand.strip('"') == bare:
+                return True
+        return False
+
     def _send_blob(self, path: Path, name: str, size: int,
                    ctype: str = "application/octet-stream",
-                   inline: bool = False) -> None:
+                   inline: bool = False, sha256: str | None = None) -> None:
         """Attachments: opaque bytes. Default is a forced download. `inline`
-        is used only for images the server verified by magic bytes at upload;
+        is used only for media the server verified by magic bytes at upload;
         even then, a CSP sandbox rides along so the bytes can never act as a
-        document with script, and nosniff pins the declared type."""
-        ascii_name = name.encode("ascii", "replace").decode().replace('"', "_")
-        disp = "inline" if inline else "attachment"
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        if inline:
-            self.send_header("Content-Security-Policy",
-                             "default-src 'none'; sandbox")
-            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("Content-Disposition",
-                         f'{disp}; filename="{ascii_name}"; '
-                         f"filename*=UTF-8''{quote(name)}")
-        self.send_header("Content-Length", str(size))
-        self.end_headers()
-        with open(path, "rb") as f:
-            shutil.copyfileobj(f, self.wfile, 65536)
+        document with script, and nosniff pins the declared type.
+
+        Framing rule: Content-Length ALWAYS comes from fstat on the very fd
+        being streamed, never from meta['size']. A stale meta size (crash-
+        partial write, hand-edited tree) would otherwise promise more bytes
+        than get sent, and on a keep-alive connection the client then reads
+        the NEXT response's bytes as this body's tail — one bad meta poisons
+        every later exchange on the socket. Open-then-fstat also closes the
+        TOCTOU window a stat-then-open pair leaves.
+
+        Blobs are immutable once routed (a delete tombstones the message and
+        api.attachment 404s), so the upload-time sha256 is a permanent strong
+        validator: it drives ETag + immutable Cache-Control, If-None-Match →
+        304, and If-Range-gated single-range 206s (media seeking). Every
+        status emitted here carries the full security header set — read
+        'Security posture — do NOT weaken' in API.md before adding one."""
+        try:
+            f = open(path, "rb")
+        except OSError:
+            # the blob vanished between api.attachment's checks and here (a
+            # delete race): gone is gone, and no headers are out yet, so this
+            # still surfaces as a clean 404 instead of a mid-stream abort
+            raise ApiError(404, "no such attachment")
+        with f:
+            fsize = os.fstat(f.fileno()).st_size
+            if fsize != size:
+                # serve the truth (the file), not the claim (the meta): a 404
+                # here would take a working attachment down over bookkeeping
+                log(f"blob {path}: meta size {size} != file size {fsize}; "
+                    "serving file size")
+            etag = f'"{sha256}"' if sha256 else None
+
+            def security_headers():
+                # the invariant set that rides on EVERY status this path can
+                # emit (200/206/304/416) — see the posture section in API.md
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if inline:
+                    self.send_header("Content-Security-Policy",
+                                     "default-src 'none'; sandbox")
+                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+                self._hsts()
+
+            # conditional GET first: RFC 9110 §13.2.2 evaluates If-None-Match
+            # before Range, so a revalidation never turns into a partial
+            if etag and self._inm_match(etag):
+                self.send_response(304)
+                security_headers()
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control",
+                                 "private, max-age=31536000, immutable")
+                # no Content-Length: a 304 is bodiless BY STATUS (RFC 9110
+                # §15.4.5), so omitting it keeps keep-alive framing exact,
+                # while echoing the full-body length would only mislead
+                self.end_headers()
+                return
+            # If-Range: a client resuming a download proves it still holds
+            # OUR bytes; anything else (mismatch, weak W/ validator, a date —
+            # we never emit Last-Modified, or no sha256 to compare against)
+            # serves the WHOLE file so two representations can't be spliced.
+            rng = None
+            if_range = self.headers.get("If-Range")
+            if if_range is None or (etag is not None
+                                    and if_range.strip() == etag):
+                rng = self._parse_range(self.headers.get("Range"), fsize)
+            if rng == "unsat":
+                self.send_response(416)
+                security_headers()
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes */{fsize}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status, start = (206, rng[0]) if rng else (200, 0)
+            end = rng[1] if rng else fsize - 1
+            span = end - start + 1
+            ascii_name = (name.encode("ascii", "replace").decode()
+                          .replace('"', "_"))
+            disp = "inline" if inline else "attachment"
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            security_headers()
+            self.send_header("Content-Disposition",
+                             f'{disp}; filename="{ascii_name}"; '
+                             f"filename*=UTF-8''{quote(name)}")
+            self.send_header("Accept-Ranges", "bytes")
+            if etag:
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control",
+                                 "private, max-age=31536000, immutable")
+            if status == 206:
+                self.send_header("Content-Range",
+                                 f"bytes {start}-{end}/{fsize}")
+            self.send_header("Content-Length", str(span))
+            self.end_headers()
+            if self._head:
+                return             # HEAD: true headers, zero body bytes
+            f.seek(start)
+            remaining = span
+            while remaining:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    # the file shrank mid-stream (nothing should ever do this
+                    # to a routed blob). Content-Length can no longer be
+                    # honored, so kill the connection rather than let the
+                    # client read the next response as this body's tail.
+                    self.close_connection = True
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _static(self, parts: list[str]) -> None:
         if self.static_dir is None:
@@ -258,8 +497,34 @@ class Handler(BaseHTTPRequestHandler):
         self._send_static(target)
 
     def _send_static(self, path: Path) -> None:
+        """Streamed, never slurped. read_bytes() materialised the whole file on
+        the heap and held it there until the last byte reached a possibly-slow
+        socket — and /download/app.apk is served from here, BEFORE any auth
+        check. A few dozen unauthenticated clients asking for a 40 MB APK and
+        then reading at a trickle was MAX_CONNECTIONS x filesize of live heap
+        on the one small VM this is meant to run on: OOM, and every user loses
+        chat. Peak is now one 64 KiB chunk per request. Content-Length comes
+        from the OPEN fd, not a second stat, which also closes the stat/open
+        race the same way _send_blob does."""
         ctype = STATIC_TYPES.get(path.suffix.lower())
-        data = path.read_bytes()
+        with open(path, "rb") as f:
+            fsize = os.fstat(f.fileno()).st_size
+            self._send_static_head(path, ctype, fsize)
+            if self._head:      # HEAD: true Content-Length, zero body bytes,
+                return          # and now zero bytes READ as well
+            remaining = fsize
+            while remaining:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    # shrank mid-stream: Content-Length can no longer be
+                    # honored, so kill the connection rather than let the
+                    # client read the next response as this body's tail
+                    self.close_connection = True
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
+    def _send_static_head(self, path: Path, ctype, length: int) -> None:
         self.send_response(200)
         if ctype is None:
             ctype = "application/octet-stream"
@@ -271,9 +536,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Security-Policy", CSP)
             self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(length))
         self.end_headers()
-        self.wfile.write(data)
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
@@ -281,13 +545,22 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     spawned — so a flood (including slowloris clients that dribble headers and
     would otherwise each hold a thread + FD) can't exhaust threads/FDs. Excess
     connections are closed immediately; the semaphore is released when the
-    connection's thread finishes. This is the real thread/FD bound; put a
-    reverse proxy in front for production-grade connection limiting."""
+    connection's thread finishes. This is the real thread/FD bound.
+
+    A reverse proxy in front gives production-grade connection limiting, but
+    note what it does to the LOGIN caps: api.login is keyed on
+    client_address[0], so terminating TLS/TCP upstream (or reaching this
+    server across a NAT gateway) collapses every user onto one limiter key and
+    turns LOGIN_IP_LIMIT into a company-wide 60-per-5-minutes admission gate.
+    Raise it for any shared-egress deployment — and do NOT reach for
+    X-Forwarded-For unless a trusted-proxy allowlist comes with it, since an
+    unauthenticated header would let every client pick its own limiter key."""
     max_connections = MAX_CONNECTIONS
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self._conn_slots = threading.BoundedSemaphore(self.max_connections)
+        self.tls_context = None      # set by build_server when --cert is given
 
     def process_request(self, request, client_address):
         if not self._conn_slots.acquire(blocking=False):
@@ -297,9 +570,40 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 
     def process_request_thread(self, request, client_address):
         try:
+            if self.tls_context is not None:
+                request = self._handshake(request)
+                if request is None:
+                    return
             super().process_request_thread(request, client_address)
         finally:
             self._conn_slots.release()
+
+    def _handshake(self, sock):
+        """TLS handshake, in the WORKER thread and on a clock.
+
+        It used to happen inside accept(): wrapping the LISTENING socket makes
+        SSLSocket.accept() do the handshake before it returns, on a socket with
+        no timeout, in serve_forever's single accept loop. One unauthenticated
+        peer that completed the TCP connect and then sent nothing blocked that
+        loop forever — the whole server, from one connection and zero bytes,
+        with httpd.shutdown() unable to return either. None of the hardening
+        below the accept applied, because nothing below the accept ever ran:
+        the semaphore, the 75s handler timeout and the slowloris story in this
+        class's docstring are all downstream of it.
+
+        Here it costs one bounded slot and gives up after HANDSHAKE_TIMEOUT."""
+        try:
+            sock.settimeout(HANDSHAKE_TIMEOUT)
+            tls = self.tls_context.wrap_socket(sock, server_side=True)
+        except (OSError, ValueError):
+            # timeout, a non-TLS peer, an unsupported version, a bad cert —
+            # all of it is one dead connection, never a server-wide event
+            self.shutdown_request(sock)
+            return None
+        # back to blocking for the request itself: Handler.timeout owns the
+        # read deadline from here, and a leftover 15s would break long-polls
+        tls.settimeout(None)
+        return tls   # the WRAPPED socket is what the handler must be given
 
 
 def build_server(store: Store, host: str, port: int,
@@ -315,7 +619,10 @@ def build_server(store: Store, host: str, port: int,
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(certfile)
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        # The LISTENER stays plain on purpose — see BoundedHTTPServer._handshake.
+        # Wrapping it here put the handshake inside accept(), where one silent
+        # connection wedged the entire server.
+        httpd.tls_context = ctx
     router.start()
     return httpd, router, api
 
